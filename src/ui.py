@@ -162,3 +162,75 @@ def page_trader():
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
+
+    # Basket state
+    if "basket" not in st.session_state:
+        st.session_state.basket = []
+        st.session_state.basket_created_at = time.time()
+
+    # Expiry
+    age_sec = time.time() - st.session_state.basket_created_at
+    if age_sec > timeout_min * 60:
+        st.session_state.basket = []
+        st.session_state.basket_created_at = time.time()
+        st.info("Basket expired and has been cleared.")
+
+    st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
+
+    # Controls
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    with c1:
+        product = st.selectbox("Product", sorted(df["Product"].dropna().unique().tolist()))
+    with c2:
+        location = st.selectbox("Location", sorted(df["Location"].dropna().unique().tolist()))
+    with c3:
+        window = st.selectbox("Delivery Window", sorted(df["Delivery Window"].dropna().unique().tolist()))
+    with c4:
+        qty = st.number_input("Qty (t)", min_value=0.0, value=10.0, step=1.0)
+
+    if st.button("Add to basket", use_container_width=True):
+        st.session_state.basket.append({
+            "Product": product,
+            "Location": location,
+            "Delivery Window": window,
+            "Qty": float(qty),
+        })
+        st.rerun()
+
+    # Basket table
+    if st.session_state.basket:
+        bdf = pd.DataFrame(st.session_state.basket)
+        st.markdown("### Basket")
+        st.dataframe(bdf, use_container_width=True, hide_index=True)
+
+        if st.button("Clear basket"):
+            st.session_state.basket = []
+            st.session_state.basket_created_at = time.time()
+            st.rerun()
+
+        if st.button("Optimise", type="primary", use_container_width=True):
+            res = optimise_basket(
+                supplier_prices=df[["Supplier", "Product", "Location", "Delivery Window", "Price"]],
+                basket=st.session_state.basket,
+                tiers=tiers
+            )
+            if not res.get("ok"):
+                st.error(res.get("error", "Unknown error"))
+                return
+
+            st.markdown("### Optimal allocation")
+            st.dataframe(pd.DataFrame(res["allocation"]), use_container_width=True, hide_index=True)
+
+            if res.get("lot_charges"):
+                st.markdown("### Small-lot charges")
+                st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
+
+            st.markdown("### Totals")
+            st.write({
+                "Base cost": res["base_cost"],
+                "Small-lot total": res["lot_charge_total"],
+                "Grand total": res["total"],
+            })
+    else:
+        st.info("Basket is empty.")
+
