@@ -43,7 +43,7 @@ def _get_latest_prices_df():
 
 
 def page_admin():
-    if st.session_state.role != "admin":
+    if st.session_state.get("role") != "admin":
         st.warning("Admin access required.")
         return
 
@@ -67,8 +67,14 @@ def page_admin():
     st.markdown("### Small-lot tiers (global)")
     tiers = get_small_lot_tiers()
 
+    # Ensure expected columns exist even if tiers table is empty
+    if tiers is None or tiers.empty:
+        tiers = pd.DataFrame(columns=["min_t", "max_t", "charge_per_t", "active"])
+    else:
+        tiers = tiers[["min_t", "max_t", "charge_per_t", "active"]].copy()
+
     edited = st.data_editor(
-        tiers[["min_t", "max_t", "charge_per_t", "active"]],
+        tiers,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
@@ -82,10 +88,22 @@ def page_admin():
 
     if st.button("Save tiers", type="primary", use_container_width=True):
         try:
-            # Convert checkbox True/False to 1/0
             edited2 = edited.copy()
+
+            # Normalize active checkbox to 0/1
+            if "active" not in edited2.columns:
+                edited2["active"] = 1
             edited2["active"] = edited2["active"].apply(lambda x: 1 if bool(x) else 0)
-            save_small_lot_tiers(edited2)
+
+            # Ensure expected numeric columns exist
+            for col in ["min_t", "charge_per_t"]:
+                if col not in edited2.columns:
+                    raise ValueError(f"Missing column '{col}'.")
+
+            if "max_t" not in edited2.columns:
+                edited2["max_t"] = None
+
+            save_small_lot_tiers(edited2[["min_t", "max_t", "charge_per_t", "active"]])
             st.success("Tiers saved.")
             st.rerun()
         except Exception as e:
@@ -105,7 +123,7 @@ def page_admin():
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             if st.button("Publish supplier snapshot", type="primary", use_container_width=True):
-                sid = publish_supplier_snapshot(df, st.session_state.user, content)
+                sid = publish_supplier_snapshot(df, st.session_state.get("user", "unknown"), content)
                 st.success(f"Published supplier snapshot: {sid}")
                 st.rerun()
         except Exception as e:
@@ -119,6 +137,7 @@ def page_history():
         st.info("No snapshots yet.")
         return
 
+    snaps = snaps.copy()
     snaps["label"] = snaps["published_at_utc"] + " | " + snaps["published_by"] + " | " + snaps["snapshot_id"].str[:8]
     label = st.selectbox("Select snapshot", snaps["label"].tolist())
     sid = snaps.loc[snaps["label"] == label, "snapshot_id"].iloc[0]
@@ -142,77 +161,4 @@ def page_trader():
 
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
-
     tiers = get_small_lot_tiers()
-
-    # Basket state
-    if "basket" not in st.session_state:
-        st.session_state.basket = []
-        st.session_state.basket_created_at = time.time()
-
-    # Expiry
-    age_sec = time.time() - st.session_state.basket_created_at
-    if age_sec > timeout_min * 60:
-        st.session_state.basket = []
-        st.session_state.basket_created_at = time.time()
-        st.info("Basket expired and has been cleared.")
-
-    st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
-
-    # Controls
-    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-    with c1:
-        product = st.selectbox("Product", sorted(df["Product"].unique()))
-    with c2:
-        location = st.selectbox("Location", sorted(df["Location"].unique()))
-    with c3:
-        window = st.selectbox("Delivery Window", sorted(df["Delivery Window"].unique()))
-    with c4:
-        qty = st.number_input("Qty (t)", min_value=0.0, value=10.0, step=1.0)
-
-    if st.button("Add to basket", use_container_width=True):
-        st.session_state.basket.append({
-            "Product": product,
-            "Location": location,
-            "Delivery Window": window,
-            "Qty": float(qty),
-        })
-        st.rerun()
-
-    # Basket table
-    if st.session_state.basket:
-        bdf = pd.DataFrame(st.session_state.basket)
-        st.markdown("### Basket")
-        st.dataframe(bdf, use_container_width=True, hide_index=True)
-
-        if st.button("Clear basket"):
-            st.session_state.basket = []
-            st.session_state.basket_created_at = time.time()
-            st.rerun()
-
-        if st.button("Optimise", type="primary", use_container_width=True):
-            res = optimise_basket(
-                supplier_prices=df[["Supplier", "Product", "Location", "Delivery Window", "Price"]],
-                basket=st.session_state.basket,
-                tiers=tiers
-            )
-            if not res["ok"]:
-                st.error(res["error"])
-                return
-
-            st.markdown("### Optimal allocation")
-            st.dataframe(pd.DataFrame(res["allocation"]), use_container_width=True, hide_index=True)
-
-            if res["lot_charges"]:
-                st.markdown("### Small-lot charges")
-                st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
-
-            st.markdown("### Totals")
-            st.write({
-                "Base cost": res["base_cost"],
-                "Small-lot total": res["lot_charge_total"],
-                "Grand total": res["total"],
-            })
-    else:
-        st.info("Basket is empty.")
-
