@@ -631,6 +631,13 @@ def page_trader_best_prices():
 
     # --- One-click add to basket ---
     _ensure_basket()
+    settings = get_settings()
+    timeout_min = int(settings.get("basket_timeout_minutes", "20"))
+    age_sec = time.time() - st.session_state.basket_created_at
+    if age_sec > timeout_min * 60:
+        st.session_state.basket = []
+        st.session_state.basket_created_at = time.time()
+        st.info("Basket expired and has been cleared.")
     st.markdown("### Add to basket from board")
 
     qty = st.number_input("Qty (t) for selected lines", min_value=0.0, value=10.0, step=1.0)
@@ -666,8 +673,9 @@ def page_trader_best_prices():
                     "Qty": float(qty),
                 })
             st.success(f"Added {len(selected)} line(s) to basket.")
+            st.info("Go to Trader | Pricing to optimise and submit the order.")
             st.rerun()
-
+    
     st.divider()
 
     # Optional: also show a clean non-edit table below (visual-only)
