@@ -15,6 +15,7 @@ from src.db import (
     get_order_header, get_order_lines, get_order_actions,
     trader_cancel_order, trader_accept_counter,
     admin_counter_order, admin_confirm_order, admin_reject_order, admin_mark_filled,
+    admin_blotter_lines,
     admin_margin_report
 )
 from src.validation import load_supplier_sheet
@@ -817,7 +818,7 @@ def page_admin_blotter():
 
     st.subheader("Admin | Blotter")
 
-    rep = admin_margin_report()
+    rep = admin_blotter_lines()
     if rep is None or rep.empty:
         st.info("No filled orders yet (or report is empty).")
         return
@@ -881,17 +882,21 @@ def page_admin_blotter():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ---- Type fixes ----
-    df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0.0)
-    df["Sell Price"] = pd.to_numeric(df["Sell Price"], errors="coerce").fillna(0.0)
-    df["Base Price"] = pd.to_numeric(df["Base Price"], errors="coerce").fillna(0.0)
+        df = rep.copy()
 
-    # ---- Derived metrics ----
-    df["sell_value"] = df["Sell Price"] * df["Qty"]
-    df["base_value"] = df["Base Price"] * df["Qty"]
-    df["gross_margin"] = df["sell_value"] - df["base_value"]
-    df["gm_pct"] = (df["gross_margin"] / df["sell_value"]) * 100.0
-    df["gm_pct"] = df["gm_pct"].where(df["sell_value"] != 0, 0.0)
+        # Type fixes
+        df["created_at_utc"] = pd.to_datetime(df["created_at_utc"], errors="coerce", utc=True)
+        df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0.0)
+        df["base_price"] = pd.to_numeric(df["base_price"], errors="coerce").fillna(0.0)
+        df["sell_price"] = pd.to_numeric(df["sell_price"], errors="coerce").fillna(0.0)
+    
+        # Derived
+        df["sell_value"] = df["sell_price"] * df["qty"]
+        df["base_value"] = df["base_price"] * df["qty"]
+        df["gross_margin"] = df["sell_value"] - df["base_value"]
+        df["gm_pct"] = (df["gross_margin"] / df["sell_value"]) * 100.0
+        df["gm_pct"] = df["gm_pct"].where(df["sell_value"] != 0, 0.0)
+
 
     # ---- Filters (top row) ----
     st.markdown("### Filters")
