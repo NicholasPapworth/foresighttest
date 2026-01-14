@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime, timezone
 import hashlib
 import uuid
+import json
 
 DB_PATH = "foresight.db"
 
@@ -10,13 +11,19 @@ DB_PATH = "foresight.db"
 def conn():
     c = sqlite3.connect(DB_PATH, check_same_thread=False)
     c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
     return c
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def init_db():
     c = conn()
     cur = c.cursor()
 
+    # --- Supplier snapshots ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS supplier_snapshots (
         snapshot_id TEXT PRIMARY KEY,
@@ -42,7 +49,13 @@ def init_db():
     );
     """)
 
-    # --- Admin margins (category/product) ---
+    # Helpful indexes
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_supplier_prices_lookup
+    ON supplier_prices (snapshot_id, product, location, delivery_window);
+    """)
+
+    # --- Admin margins ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS price_margins (
         margin_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,14 +68,13 @@ def init_db():
     );
     """)
 
+    # --- App settings ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
     """)
-
-    # Defaults
     _set_default(cur, "basket_timeout_minutes", "20")
 
     # --- Tiered small-lot charges (global) ---
@@ -91,6 +103,56 @@ def init_db():
             (24.0, None, 0.0),  # >=24t no charge
         ])
 
+    # --- Orders workflow (NEW) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        order_id TEXT PRIMARY KEY,
+        created_at_utc TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        status TEXT NOT NULL,
+        supplier_snapshot_id TEXT NOT NULL,
+        last_action_at_utc TEXT NOT NULL,
+        last_action_by TEXT NOT NULL,
+        trader_note TEXT,
+        admin_note TEXT,
+        FOREIGN KEY (supplier_snapshot_id) REFERENCES supplier_snapshots(snapshot_id)
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS order_lines (
+        order_id TEXT NOT NULL,
+        line_no INTEGER NOT NULL,
+        product_category TEXT,
+        product TEXT NOT NULL,
+        location TEXT NOT NULL,
+        delivery_window TEXT NOT NULL,
+        qty REAL NOT NULL,
+        unit TEXT NOT NULL,
+        supplier TEXT NOT NULL,
+        base_price REAL NOT NULL,
+        sell_price REAL NOT NULL,
+        PRIMARY KEY (order_id, line_no),
+        FOREIGN KEY (order_id) REFERENCES orders(order_id)
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS order_actions (
+        action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        action_at_utc TEXT NOT NULL,
+        action_by TEXT NOT NULL,
+        payload_json TEXT,
+        FOREIGN KEY (order_id) REFERENCES orders(order_id)
+    );
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_by_user ON orders(created_by, created_at_utc);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at_utc);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_order ON order_actions(order_id, action_at_utc);")
+
     c.commit()
     c.close()
 
@@ -100,6 +162,8 @@ def _set_default(cur, key, value):
     if not cur.fetchone():
         cur.execute("INSERT INTO app_settings (key, value) VALUES (?, ?)", (key, value))
 
+
+# ---------------- Settings ----------------
 
 def get_settings() -> dict:
     c = conn()
@@ -118,6 +182,8 @@ def set_setting(key: str, value: str):
     c.commit()
     c.close()
 
+
+# ---------------- Supplier snapshots ----------------
 
 def list_supplier_snapshots(limit=200) -> pd.DataFrame:
     c = conn()
@@ -166,7 +232,7 @@ def load_supplier_prices(snapshot_id: str) -> pd.DataFrame:
 
 def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes: bytes) -> str:
     snapshot_id = str(uuid.uuid4())
-    published_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    published_at = utc_now_iso()
     source_hash = hashlib.sha256(source_bytes).hexdigest()
     row_count = int(len(df))
 
@@ -185,7 +251,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r["Supplier"]).strip(),
             str(r.get("Product Category", "")).strip(),
             str(r["Product"]).strip(),
-            str(r["Location"]).strip(),
+            str(r.get("Location", "")).strip(),
             str(r["Delivery Window"]).strip(),
             float(r["Price"]),
             str(r["Unit"]).strip(),
@@ -202,6 +268,8 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     return snapshot_id
 
 
+# ---------------- Small-lot tiers ----------------
+
 def get_small_lot_tiers() -> pd.DataFrame:
     c = conn()
     df = pd.read_sql_query("""
@@ -214,13 +282,8 @@ def get_small_lot_tiers() -> pd.DataFrame:
 
 
 def save_small_lot_tiers(df: pd.DataFrame):
-    """
-    Expects columns: min_t, max_t, charge_per_t, active
-    Replaces all tiers in DB.
-    """
     work = df.copy()
 
-    # Require these columns
     for col in ["min_t", "charge_per_t"]:
         if col not in work.columns:
             raise ValueError(f"Missing column '{col}' in tiers editor.")
@@ -277,13 +340,12 @@ def save_small_lot_tiers(df: pd.DataFrame):
     c.close()
 
 
-# ----------------- Margins -----------------
+# ---------------- Margins ----------------
 
 def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str):
     scope_type = str(scope_type).strip().lower()
     if scope_type not in ("category", "product"):
         raise ValueError("scope_type must be 'category' or 'product'.")
-
     scope_value = str(scope_value).strip()
     if not scope_value:
         raise ValueError("scope_value cannot be empty.")
@@ -294,13 +356,7 @@ def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str
         INSERT INTO price_margins
         (scope_type, scope_value, margin_per_t, active, created_at_utc, created_by)
         VALUES (?, ?, ?, 1, ?, ?)
-    """, (
-        scope_type,
-        scope_value,
-        float(margin_per_t),
-        datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        user
-    ))
+    """, (scope_type, scope_value, float(margin_per_t), utc_now_iso(), user))
     c.commit()
     c.close()
 
@@ -333,11 +389,6 @@ def deactivate_margin(margin_id: int):
 
 
 def get_effective_margins() -> pd.DataFrame:
-    """
-    Returns the effective margin per scope_type/scope_value.
-    If multiple active entries exist for the same scope, the most recent (highest margin_id) wins.
-    Output columns: scope_type, scope_value, margin_per_t
-    """
     c = conn()
     df = pd.read_sql_query("""
         SELECT margin_id, scope_type, scope_value, margin_per_t
@@ -352,6 +403,339 @@ def get_effective_margins() -> pd.DataFrame:
 
     df = df.drop_duplicates(subset=["scope_type", "scope_value"], keep="first")
     return df[["scope_type", "scope_value", "margin_per_t"]]
+
+
+# ---------------- Orders workflow ----------------
+
+ORDER_STATUSES = {"PENDING", "COUNTERED", "CONFIRMED", "FILLED", "REJECTED", "CANCELLED"}
+
+def _add_action(cur, order_id: str, action_type: str, action_by: str, payload: dict | None = None):
+    cur.execute("""
+        INSERT INTO order_actions (order_id, action_type, action_at_utc, action_by, payload_json)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        order_id,
+        action_type,
+        utc_now_iso(),
+        action_by,
+        None if payload is None else json.dumps(payload)
+    ))
+
+
+def create_order_from_allocation(
+    created_by: str,
+    supplier_snapshot_id: str,
+    allocation_lines: list[dict],
+    trader_note: str = ""
+) -> str:
+    """
+    allocation_lines: list of dicts containing:
+      Product Category, Product, Location, Delivery Window, Qty, Unit, Supplier, Base Price, Sell Price
+    """
+    if not allocation_lines:
+        raise ValueError("No allocation lines to create order.")
+
+    order_id = str(uuid.uuid4())
+    now = utc_now_iso()
+
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+        INSERT INTO orders
+        (order_id, created_at_utc, created_by, status, supplier_snapshot_id, last_action_at_utc, last_action_by, trader_note, admin_note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (order_id, now, created_by, "PENDING", supplier_snapshot_id, now, created_by, trader_note, ""))
+
+    rows = []
+    for i, ln in enumerate(allocation_lines, start=1):
+        rows.append((
+            order_id,
+            i,
+            str(ln.get("Product Category", "")).strip(),
+            str(ln["Product"]).strip(),
+            str(ln.get("Location", "")).strip(),
+            str(ln["Delivery Window"]).strip(),
+            float(ln["Qty"]),
+            str(ln.get("Unit", "£/t")).strip(),
+            str(ln["Supplier"]).strip(),
+            float(ln["Base Price"]),
+            float(ln["Sell Price"]),
+        ))
+
+    cur.executemany("""
+        INSERT INTO order_lines
+        (order_id, line_no, product_category, product, location, delivery_window, qty, unit, supplier, base_price, sell_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+
+    _add_action(cur, order_id, "SUBMIT", created_by, {"lines": len(rows)})
+
+    cur.execute("""
+        UPDATE orders
+        SET last_action_at_utc = ?, last_action_by = ?, status = 'PENDING'
+        WHERE order_id = ?
+    """, (utc_now_iso(), created_by, order_id))
+
+    c.commit()
+    c.close()
+    return order_id
+
+
+def list_orders_for_user(user: str) -> pd.DataFrame:
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT order_id, created_at_utc, status, supplier_snapshot_id, last_action_at_utc, trader_note
+        FROM orders
+        WHERE created_by = ?
+        ORDER BY created_at_utc DESC
+    """, c, params=(user,))
+    c.close()
+    return df
+
+
+def list_orders_admin(status_filter: str | None = None) -> pd.DataFrame:
+    c = conn()
+    if status_filter:
+        df = pd.read_sql_query("""
+            SELECT order_id, created_at_utc, created_by, status, supplier_snapshot_id, last_action_at_utc, last_action_by
+            FROM orders
+            WHERE status = ?
+            ORDER BY created_at_utc DESC
+        """, c, params=(status_filter,))
+    else:
+        df = pd.read_sql_query("""
+            SELECT order_id, created_at_utc, created_by, status, supplier_snapshot_id, last_action_at_utc, last_action_by
+            FROM orders
+            ORDER BY created_at_utc DESC
+        """, c)
+    c.close()
+    return df
+
+
+def get_order_lines(order_id: str) -> pd.DataFrame:
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT line_no, product_category AS "Product Category", product AS "Product",
+               location AS "Location", delivery_window AS "Delivery Window",
+               qty AS "Qty", unit AS "Unit", supplier AS "Supplier",
+               base_price AS "Base Price", sell_price AS "Sell Price"
+        FROM order_lines
+        WHERE order_id = ?
+        ORDER BY line_no ASC
+    """, c, params=(order_id,))
+    c.close()
+    return df
+
+
+def get_order_header(order_id: str) -> dict | None:
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT order_id, created_at_utc, created_by, status, supplier_snapshot_id,
+               last_action_at_utc, last_action_by, trader_note, admin_note
+        FROM orders
+        WHERE order_id = ?
+    """, (order_id,))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        return None
+    keys = ["order_id","created_at_utc","created_by","status","supplier_snapshot_id","last_action_at_utc","last_action_by","trader_note","admin_note"]
+    return dict(zip(keys, row))
+
+
+def get_order_actions(order_id: str) -> pd.DataFrame:
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT action_id, action_type, action_at_utc, action_by, payload_json
+        FROM order_actions
+        WHERE order_id = ?
+        ORDER BY action_at_utc ASC
+    """, c, params=(order_id,))
+    c.close()
+    return df
+
+
+def trader_cancel_order(order_id: str, user: str):
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["created_by"] != user:
+        raise ValueError("Not your order.")
+    if h["status"] not in ("PENDING", "COUNTERED"):
+        raise ValueError(f"Cannot cancel order in status {h['status']}.")
+
+    c = conn()
+    cur = c.cursor()
+    _add_action(cur, order_id, "CANCEL", user)
+    cur.execute("""
+        UPDATE orders SET status='CANCELLED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), user, order_id))
+    c.commit()
+    c.close()
+
+
+def admin_counter_order(order_id: str, admin_user: str, edited_lines: pd.DataFrame, admin_note: str = ""):
+    """
+    edited_lines must include line_no and Sell Price (and can include Supplier if you want to allow change).
+    MVP: allow editing Sell Price only; supplier/base remain as-is.
+    """
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["status"] not in ("PENDING", "COUNTERED"):
+        raise ValueError(f"Cannot counter order in status {h['status']}.")
+
+    # Load existing for audit diff
+    before = get_order_lines(order_id)
+
+    # Normalise
+    work = edited_lines.copy()
+    if "line_no" not in work.columns:
+        raise ValueError("edited_lines must include line_no.")
+    if "Sell Price" not in work.columns:
+        raise ValueError("edited_lines must include 'Sell Price'.")
+
+    work["Sell Price"] = pd.to_numeric(work["Sell Price"], errors="raise")
+
+    c = conn()
+    cur = c.cursor()
+
+    # Update each line sell_price
+    for _, r in work.iterrows():
+        ln = int(r["line_no"])
+        sp = float(r["Sell Price"])
+        cur.execute("""
+            UPDATE order_lines
+            SET sell_price = ?
+            WHERE order_id = ? AND line_no = ?
+        """, (sp, order_id, ln))
+
+    # Update admin note
+    cur.execute("UPDATE orders SET admin_note = ? WHERE order_id = ?", (admin_note, order_id))
+
+    after = get_order_lines(order_id)
+
+    payload = {
+        "admin_note": admin_note,
+        "diff": {
+            "before": before[["line_no","Sell Price"]].to_dict("records"),
+            "after": after[["line_no","Sell Price"]].to_dict("records"),
+        }
+    }
+
+    _add_action(cur, order_id, "COUNTER", admin_user, payload)
+    cur.execute("""
+        UPDATE orders SET status='COUNTERED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), admin_user, order_id))
+
+    c.commit()
+    c.close()
+
+
+def trader_accept_counter(order_id: str, user: str):
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["created_by"] != user:
+        raise ValueError("Not your order.")
+    if h["status"] != "COUNTERED":
+        raise ValueError("Order is not in COUNTERED status.")
+
+    c = conn()
+    cur = c.cursor()
+    _add_action(cur, order_id, "ACCEPT_COUNTER", user)
+    cur.execute("""
+        UPDATE orders SET status='CONFIRMED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), user, order_id))
+    c.commit()
+    c.close()
+
+
+def admin_confirm_order(order_id: str, admin_user: str):
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["status"] not in ("PENDING", "COUNTERED"):
+        raise ValueError(f"Cannot confirm order in status {h['status']}.")
+
+    c = conn()
+    cur = c.cursor()
+    _add_action(cur, order_id, "CONFIRM", admin_user)
+    cur.execute("""
+        UPDATE orders SET status='CONFIRMED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), admin_user, order_id))
+    c.commit()
+    c.close()
+
+
+def admin_reject_order(order_id: str, admin_user: str, admin_note: str = ""):
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["status"] in ("FILLED", "REJECTED", "CANCELLED"):
+        raise ValueError(f"Cannot reject order in status {h['status']}.")
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE orders SET admin_note = ? WHERE order_id = ?", (admin_note, order_id))
+    _add_action(cur, order_id, "REJECT", admin_user, {"admin_note": admin_note})
+    cur.execute("""
+        UPDATE orders SET status='REJECTED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), admin_user, order_id))
+    c.commit()
+    c.close()
+
+
+def admin_mark_filled(order_id: str, admin_user: str):
+    h = get_order_header(order_id)
+    if not h:
+        raise ValueError("Order not found.")
+    if h["status"] != "CONFIRMED":
+        raise ValueError("Order must be CONFIRMED before it can be FILLED.")
+
+    c = conn()
+    cur = c.cursor()
+    _add_action(cur, order_id, "FILL", admin_user)
+    cur.execute("""
+        UPDATE orders SET status='FILLED', last_action_at_utc=?, last_action_by=?
+        WHERE order_id=?
+    """, (utc_now_iso(), admin_user, order_id))
+    c.commit()
+    c.close()
+
+
+def admin_margin_report() -> pd.DataFrame:
+    """
+    Simple report over FILLED orders:
+      margin = sum((sell_price - base_price) * qty)
+    """
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT
+          o.order_id,
+          o.created_at_utc,
+          o.created_by,
+          SUM(ol.qty) AS total_tonnes,
+          SUM(ol.sell_price * ol.qty) AS sell_value,
+          SUM(ol.base_price * ol.qty) AS base_value,
+          SUM((ol.sell_price - ol.base_price) * ol.qty) AS gross_margin
+        FROM orders o
+        JOIN order_lines ol ON ol.order_id = o.order_id
+        WHERE o.status = 'FILLED'
+        GROUP BY o.order_id, o.created_at_utc, o.created_by
+        ORDER BY o.created_at_utc DESC
+    """, c)
+    c.close()
+    return df
+
+
 
 
 
