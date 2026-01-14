@@ -223,7 +223,7 @@ def page_trader_pricing():
 
 
 def page_trader_orders():
-    st.subheader("Trader — Orders")
+    st.subheader("Trader | Orders")
 
     df = list_orders_for_user(st.session_state.user)
     if df.empty:
