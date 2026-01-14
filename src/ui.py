@@ -824,6 +824,55 @@ def page_admin_blotter():
 
     df = rep.copy()
 
+        # --- NORMALISE COLUMN NAMES ---
+    # admin_margin_report() might return snake_case or other names.
+    # We map whatever exists into the canonical names this page expects.
+
+    def pick(*cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+
+    qty_col = pick("Qty", "qty", "qty_t", "tonnes", "Tonnes")
+    sell_col = pick("Sell Price", "sell_price", "sell_price_per_t", "sell_price_gbp", "sell_price_per_t_gbp")
+    base_col = pick("Base Price", "base_price", "base_price_per_t", "base_price_gbp", "base_price_per_t_gbp")
+
+    # Optional dims (only used for filtering/grouping)
+    created_by_col = pick("created_by", "Created By", "trader", "Trader")
+    prod_cat_col = pick("Product Category", "product_category", "Category", "category", "Product group", "product_group")
+    product_col = pick("Product", "product")
+    location_col = pick("Location", "location", "Region", "region")
+    window_col = pick("Delivery Window", "delivery_window", "Window", "window")
+    supplier_col = pick("Supplier", "supplier")
+
+    # Rename into canonical names used below
+    rename_map = {}
+    if qty_col and qty_col != "Qty": rename_map[qty_col] = "Qty"
+    if sell_col and sell_col != "Sell Price": rename_map[sell_col] = "Sell Price"
+    if base_col and base_col != "Base Price": rename_map[base_col] = "Base Price"
+
+    if created_by_col and created_by_col != "created_by": rename_map[created_by_col] = "created_by"
+    if prod_cat_col and prod_cat_col != "Product Category": rename_map[prod_cat_col] = "Product Category"
+    if product_col and product_col != "Product": rename_map[product_col] = "Product"
+    if location_col and location_col != "Location": rename_map[location_col] = "Location"
+    if window_col and window_col != "Delivery Window": rename_map[window_col] = "Delivery Window"
+    if supplier_col and supplier_col != "Supplier": rename_map[supplier_col] = "Supplier"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Hard stop if core columns are still missing
+    required = ["Qty", "Sell Price", "Base Price"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(
+            "Blotter cannot run because admin_margin_report() does not return the required columns: "
+            + ", ".join(missing)
+            + f"\n\nAvailable columns: {list(df.columns)}"
+        )
+        return
+
     # ---- Type fixes ----
     if "created_at_utc" in df.columns:
         df["created_at_utc"] = pd.to_datetime(df["created_at_utc"], errors="coerce", utc=True)
