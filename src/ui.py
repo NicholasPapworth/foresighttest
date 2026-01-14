@@ -48,6 +48,98 @@ def _get_latest_prices_df():
     df = load_supplier_prices(sid)
     return sid, df
 
+def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns best (lowest) SELL price per Product Category/Product/Location/Delivery Window.
+    Expects df to already include Sell Price (from apply_margins).
+    """
+    work = df.copy()
+
+    # Ensure required fields exist
+    for col in ["Product Category", "Product", "Location", "Delivery Window", "Supplier", "Sell Price", "Unit"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' needed for best price board.")
+
+    # Normalise blanks
+    work["Product Category"] = work["Product Category"].fillna("").astype(str)
+    work["Location"] = work["Location"].fillna("").astype(str)
+
+    group_cols = ["Product Category", "Product", "Location", "Delivery Window"]
+
+    # Find the row index of the minimum Sell Price per group
+    idx = work.groupby(group_cols)["Sell Price"].idxmin()
+    best = work.loc[idx, group_cols + ["Supplier", "Sell Price", "Unit"]].copy()
+
+    best = best.rename(columns={
+        "Sell Price": "Best Price",
+    }).sort_values(["Product Category", "Product", "Location", "Delivery Window"])
+
+    return best.reset_index(drop=True)
+
+def page_trader_best_prices():
+    st.subheader("Trader — Best Prices")
+
+    sid, df = _get_latest_prices_df()
+    if df is None:
+        st.warning("No supplier snapshot available. Admin must publish one.")
+        return
+
+    # Apply margins (so traders see best SELL prices)
+    margins = get_effective_margins()
+    df = apply_margins(df, margins)
+
+    board = _best_prices_board(df)
+
+    # --- Filters ---
+    st.markdown("### Filters")
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
+
+    with f1:
+        cats = ["ALL"] + sorted([c for c in board["Product Category"].unique().tolist() if c != ""])
+        cat = st.selectbox("Product Category", cats)
+
+    with f2:
+        prods = ["ALL"] + sorted(board["Product"].unique().tolist())
+        prod = st.selectbox("Product", prods)
+
+    with f3:
+        locs = ["ALL"] + sorted(board["Location"].unique().tolist())
+        loc = st.selectbox("Location", locs)
+
+    with f4:
+        wins = ["ALL"] + sorted(board["Delivery Window"].unique().tolist())
+        win = st.selectbox("Delivery Window", wins)
+
+    view = board.copy()
+    if cat != "ALL":
+        view = view[view["Product Category"] == cat]
+    if prod != "ALL":
+        view = view[view["Product"] == prod]
+    if loc != "ALL":
+        view = view[view["Location"] == loc]
+    if win != "ALL":
+        view = view[view["Delivery Window"] == win]
+
+    st.divider()
+
+    # --- Display ---
+    st.caption(f"Supplier snapshot: {sid[:8]} | Rows: {len(view)}")
+
+    # Pretty table (clean column names)
+    show = view.rename(columns={
+        "Product Category": "Category",
+        "Delivery Window": "Window",
+    })
+
+    st.dataframe(
+        show[["Category", "Product", "Location", "Window", "Best Price", "Unit", "Supplier"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Best Price": st.column_config.NumberColumn("Best Price", format="£%.2f"),
+        }
+    )
+
 
 def page_trader_pricing():
     st.subheader("Trader | Pricing")
