@@ -3,7 +3,7 @@ from src.db import init_db
 from src.auth import require_login
 from src.ui import (
     render_header,
-    page_trader_pricing, page_trader_orders,
+    page_trader_pricing, page_trader_orders, page_trader_best_prices,
     page_admin_pricing, page_admin_orders,
     page_history
 )
@@ -18,6 +18,7 @@ render_header()
 
 pages_trader = {
     "Pricing": page_trader_pricing,
+    "Best Prices": page_trader_best_prices,
     "Orders": page_trader_orders,
     "History": page_history,
 }
