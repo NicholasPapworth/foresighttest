@@ -12,14 +12,7 @@ def require_login() -> bool:
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
 
-    try:
-        users = st.secrets.get("users", {})
-    except Exception:
-        users = {}
-
-    if not users:
-        st.warning("No users configured in Streamlit secrets. Add users in Streamlit Cloud → App → Settings → Secrets.")
-        return False
+    users = st.secrets.get("users", {})
 
     if st.button("Sign in", use_container_width=True):
         u = users.get(username)
@@ -30,5 +23,5 @@ def require_login() -> bool:
             st.session_state.role = u.get("role", "trader")
             st.rerun()
 
-    st.info("Admins can publish. Traders are read-only.")
+    st.info("Admins can publish and manage orders. Traders are read-only on pricing admin.")
     return False
