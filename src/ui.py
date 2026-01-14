@@ -41,20 +41,6 @@ def _get_latest_prices_df():
         return None, None
     sid, ts, by = snap
     df = load_supplier_prices(sid)
-        margins = get_effective_margins()
-    df = apply_margins(df, margins)
-
-    # Traders should not see margins; show Sell Price as Price
-    df["Price"] = df["Sell Price"]
-    df = df.drop(columns=["Sell Price"], errors="ignore")
-
-    margins = get_effective_margins()
-    df = apply_margins(df, margins)
-
-    # Traders should not see margins; show Sell Price as Price
-    df["Price"] = df["Sell Price"]
-    df = df.drop(columns=["Sell Price"], errors="ignore")
-
     return sid, df
 
 
@@ -72,7 +58,6 @@ def page_admin():
         min_value=1,
         value=int(settings.get("basket_timeout_minutes", "20"))
     )
-
     if st.button("Save settings", use_container_width=True):
         set_setting("basket_timeout_minutes", str(timeout))
         st.success("Settings saved.")
@@ -83,7 +68,6 @@ def page_admin():
     st.markdown("### Small-lot tiers (global)")
     tiers = get_small_lot_tiers()
 
-    # Ensure expected columns exist even if tiers table is empty
     if tiers is None or tiers.empty:
         tiers = pd.DataFrame(columns=["min_t", "max_t", "charge_per_t", "active"])
     else:
@@ -105,17 +89,9 @@ def page_admin():
     if st.button("Save tiers", type="primary", use_container_width=True):
         try:
             edited2 = edited.copy()
-
-            # Normalize active checkbox to 0/1
             if "active" not in edited2.columns:
                 edited2["active"] = 1
             edited2["active"] = edited2["active"].apply(lambda x: 1 if bool(x) else 0)
-
-            # Ensure expected numeric columns exist
-            for col in ["min_t", "charge_per_t"]:
-                if col not in edited2.columns:
-                    raise ValueError(f"Missing column '{col}'.")
-
             if "max_t" not in edited2.columns:
                 edited2["max_t"] = None
 
@@ -124,10 +100,12 @@ def page_admin():
             st.rerun()
         except Exception as e:
             st.error(str(e))
-        st.divider()
+
+    st.divider()
+
+    # --- Margins ---
     st.markdown("### Admin margins (hidden from traders)")
 
-    # View active margins
     mdf = list_margins(active_only=True)
     if mdf.empty:
         st.info("No active margins set.")
@@ -136,7 +114,6 @@ def page_admin():
         show = show.rename(columns={"margin_per_t": "Margin (£/t)"})
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-        # Deactivate margin
         mid = st.number_input("Deactivate margin_id", min_value=0, value=0, step=1)
         if st.button("Deactivate selected margin", use_container_width=True):
             if mid <= 0:
@@ -147,7 +124,6 @@ def page_admin():
                 st.rerun()
 
     st.markdown("#### Add new margin")
-
     scope_type = st.selectbox("Scope", ["category", "product"])
     scope_value = st.text_input("Category/Product name (exact match)")
     margin_per_t = st.number_input("Margin (£/t)", value=0.0, step=0.5)
@@ -192,7 +168,14 @@ def page_history():
     snaps["label"] = snaps["published_at_utc"] + " | " + snaps["published_by"] + " | " + snaps["snapshot_id"].str[:8]
     label = st.selectbox("Select snapshot", snaps["label"].tolist())
     sid = snaps.loc[snaps["label"] == label, "snapshot_id"].iloc[0]
+
     df = load_supplier_prices(sid)
+
+    # Apply margins (but do not expose margin)
+    margins = get_effective_margins()
+    df = apply_margins(df, margins)
+    df["Price"] = df["Sell Price"]
+    df = df.drop(columns=["Sell Price"], errors="ignore")
 
     q = st.text_input("Search")
     if q:
@@ -213,11 +196,10 @@ def page_trader():
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
-    
-    # Apply effective margins (product overrides category)
+
+    # Apply margins (trader sees only Sell Price)
     margins = get_effective_margins()
     df = apply_margins(df, margins)
-
 
     # Basket state
     if "basket" not in st.session_state:
@@ -253,7 +235,6 @@ def page_trader():
         })
         st.rerun()
 
-    # Basket table
     if st.session_state.basket:
         bdf = pd.DataFrame(st.session_state.basket)
         st.markdown("### Basket")
@@ -294,4 +275,5 @@ def page_trader():
             })
     else:
         st.info("Basket is empty.")
+
 
