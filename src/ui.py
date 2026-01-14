@@ -881,6 +881,11 @@ def page_admin_blotter():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # ---- Type fixes ----
+    df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0.0)
+    df["Sell Price"] = pd.to_numeric(df["Sell Price"], errors="coerce").fillna(0.0)
+    df["Base Price"] = pd.to_numeric(df["Base Price"], errors="coerce").fillna(0.0)
+
     # ---- Derived metrics ----
     df["sell_value"] = df["Sell Price"] * df["Qty"]
     df["base_value"] = df["Base Price"] * df["Qty"]
