@@ -301,7 +301,7 @@ def page_admin_pricing():
         st.warning("Admin access required.")
         return
 
-    st.subheader("Admin — Pricing")
+    st.subheader("Admin | Pricing")
 
     # Settings
     settings = get_settings()
