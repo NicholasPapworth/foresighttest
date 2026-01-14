@@ -68,6 +68,25 @@ def init_db():
     );
     """)
 
+    # --- Presence (who is online) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_presence (
+        user TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        role TEXT,
+        page TEXT,
+        online_since_utc TEXT NOT NULL,
+        last_seen_utc TEXT NOT NULL,
+        PRIMARY KEY (user, session_id)
+    );
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_presence_last_seen
+    ON user_presence (last_seen_utc);
+    """)
+
+
     # --- App settings ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_settings (
@@ -809,6 +828,69 @@ def admin_mark_filled(order_id: str, admin_user: str, expected_version: int | No
         expected_version=expected_version,
     )
 
+from datetime import timedelta
+
+def presence_heartbeat(user: str, role: str, page: str, session_id: str):
+    """
+    Upserts a presence heartbeat for this user+session.
+    """
+    if not user or not session_id:
+        return
+
+    now = utc_now_iso()
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO user_presence (user, session_id, role, page, online_since_utc, last_seen_utc)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user, session_id) DO UPDATE SET
+            role = excluded.role,
+            page = excluded.page,
+            last_seen_utc = excluded.last_seen_utc
+    """, (user, session_id, role, page, now, now))
+    c.commit()
+    c.close()
+
+
+def presence_signoff(user: str, session_id: str):
+    """
+    Removes this session from presence (call on logout if you have a logout action).
+    """
+    if not user or not session_id:
+        return
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM user_presence WHERE user = ? AND session_id = ?", (user, session_id))
+    c.commit()
+    c.close()
+
+
+def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
+    """
+    Returns distinct users considered 'online' if last_seen is within threshold.
+    Also performs a small cleanup of stale sessions.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=int(online_within_seconds))).isoformat(timespec="seconds")
+
+    c = conn()
+    cur = c.cursor()
+
+    # Cleanup stale sessions (optional but recommended)
+    cur.execute("DELETE FROM user_presence WHERE last_seen_utc < ?", (cutoff,))
+    c.commit()
+
+    df = pd.read_sql_query("""
+        SELECT user, role, page, MIN(online_since_utc) AS online_since_utc, MAX(last_seen_utc) AS last_seen_utc
+        FROM user_presence
+        WHERE last_seen_utc >= ?
+        GROUP BY user, role, page
+        ORDER BY user ASC
+    """, c, params=(cutoff,))
+    c.close()
+    return df
+
 def admin_margin_report() -> pd.DataFrame:
     """
     Simple report over FILLED orders:
@@ -832,6 +914,7 @@ def admin_margin_report() -> pd.DataFrame:
     """, c)
     c.close()
     return df
+
 
 
 
