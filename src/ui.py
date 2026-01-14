@@ -1,6 +1,9 @@
 import time
 import streamlit as st
 import pandas as pd
+import uuid
+from datetime import datetime, timezone
+from src.db import presence_heartbeat, list_online_users
 
 from src.db import (
     get_settings, set_setting,
@@ -675,6 +678,93 @@ def page_trader_best_prices():
             st.success(f"Added {len(selected)} line(s) to basket.")
             st.info("Go to Trader | Pricing to optimise and submit the order.")
             st.rerun()
+    def _ensure_session_id():
+    if "presence_session_id" not in st.session_state:
+        st.session_state.presence_session_id = str(uuid.uuid4())
+
+
+def _utc_parse(ts: str):
+    # ts like "2026-01-14T15:12:34+00:00"
+    return datetime.fromisoformat(ts)
+
+
+def render_presence_panel(current_page_name: str, *, refresh_ms: int = 10_000):
+    """
+    Xbox-style presence panel:
+    - Heartbeat this user
+    - Show who is online
+    - Toast when someone comes online/offline (based on last refresh)
+    """
+    _ensure_session_id()
+
+    user = st.session_state.get("user", "")
+    role = st.session_state.get("role", "")
+    session_id = st.session_state.presence_session_id
+
+    # Heartbeat every run (and on auto-refresh)
+    presence_heartbeat(user=user, role=role, page=current_page_name, session_id=session_id)
+
+    # Optional: auto-refresh (if available)
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=refresh_ms, key="presence_autorefresh")
+    except Exception:
+        # No dependency installed; panel will update when user interacts
+        pass
+
+    df = list_online_users(online_within_seconds=45)
+
+    # --- Toast notifications (diff vs previous) ---
+    prev = set(st.session_state.get("presence_prev_online", []))
+    now = set(df["user"].tolist()) if not df.empty else set()
+
+    came_online = sorted(now - prev)
+    went_offline = sorted(prev - now)
+
+    # Avoid toasting on very first render
+    if "presence_prev_online" in st.session_state:
+        for u in came_online:
+            st.toast(f"{u} is now online")
+        for u in went_offline:
+            st.toast(f"{u} went offline")
+
+    st.session_state.presence_prev_online = list(now)
+
+    # --- Sexy-ish UX (clean, compact, readable) ---
+    st.markdown("### Online now")
+
+    if df.empty:
+        st.caption("No active users detected.")
+        return
+
+    # Add a small 'last seen seconds ago' metric
+    now_dt = datetime.now(timezone.utc)
+
+    rows = []
+    for _, r in df.iterrows():
+        last_seen = _utc_parse(r["last_seen_utc"])
+        sec_ago = int((now_dt - last_seen).total_seconds())
+        rows.append({
+            "User": r["user"],
+            "Role": r.get("role", ""),
+            "Page": r.get("page", ""),
+            "Last seen": f"{sec_ago}s ago"
+        })
+
+    out = pd.DataFrame(rows)
+
+    # Minimal “presence list” styling using Streamlit primitives
+    st.dataframe(
+        out,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "User": st.column_config.TextColumn("User"),
+            "Role": st.column_config.TextColumn("Role"),
+            "Page": st.column_config.TextColumn("Page"),
+            "Last seen": st.column_config.TextColumn("Last seen"),
+        }
+    )
     
     st.divider()
 
