@@ -42,6 +42,19 @@ def init_db():
     );
     """)
 
+        # --- Admin margins (category/product) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS price_margins (
+        margin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('category','product')),
+        scope_value TEXT NOT NULL,
+        margin_per_t REAL NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at_utc TEXT NOT NULL,
+        created_by TEXT NOT NULL
+    );
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS app_settings (
         key TEXT PRIMARY KEY,
@@ -207,6 +220,81 @@ def save_small_lot_tiers(df: pd.DataFrame):
     """
     work = df.copy()
 
+def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str):
+    scope_type = str(scope_type).strip().lower()
+    if scope_type not in ("category", "product"):
+        raise ValueError("scope_type must be 'category' or 'product'.")
+
+    scope_value = str(scope_value).strip()
+    if not scope_value:
+        raise ValueError("scope_value cannot be empty.")
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO price_margins
+        (scope_type, scope_value, margin_per_t, active, created_at_utc, created_by)
+        VALUES (?, ?, ?, 1, ?, ?)
+    """, (
+        scope_type,
+        scope_value,
+        float(margin_per_t),
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        user
+    ))
+    c.commit()
+    c.close()
+
+
+def list_margins(active_only: bool = True) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT margin_id, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by
+            FROM price_margins
+            WHERE active = 1
+            ORDER BY margin_id DESC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT margin_id, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by
+            FROM price_margins
+            ORDER BY margin_id DESC
+        """, c)
+    c.close()
+    return df
+
+
+def deactivate_margin(margin_id: int):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE price_margins SET active = 0 WHERE margin_id = ?", (int(margin_id),))
+    c.commit()
+    c.close()
+
+
+def get_effective_margins() -> pd.DataFrame:
+    """
+    Returns the effective margin per scope_type/scope_value.
+    If multiple active entries exist for the same scope, the most recent (highest margin_id) wins.
+    Output columns: scope_type, scope_value, margin_per_t
+    """
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT margin_id, scope_type, scope_value, margin_per_t
+        FROM price_margins
+        WHERE active = 1
+        ORDER BY margin_id DESC
+    """, c)
+    c.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["scope_type", "scope_value", "margin_per_t"])
+
+    # Keep most recent entry per (scope_type, scope_value)
+    df = df.drop_duplicates(subset=["scope_type", "scope_value"], keep="first")
+    return df[["scope_type", "scope_value", "margin_per_t"]]
+
     # Require these columns
     for col in ["min_t", "charge_per_t"]:
         if col not in work.columns:
@@ -262,5 +350,6 @@ def save_small_lot_tiers(df: pd.DataFrame):
 
     c.commit()
     c.close()
+
 
 
