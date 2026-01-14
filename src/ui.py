@@ -221,7 +221,12 @@ def page_trader_pricing():
                 st.error(f"Internal error: could not find base row for {prod}/{loc}/{win}/{sup}")
                 return
 
-            base_price = float(match.iloc[0]["Price"])
+            base_col = "Price" if "Price" in match.columns else ("Base Price" if "Base Price" in match.columns else None)
+            if base_col is None:
+                st.error("Internal error: missing base price column (expected 'Price' or 'Base Price').")
+                return
+            base_price = float(match.iloc[0][base_col])
+
             sell_price = float(match.iloc[0]["Sell Price"])
             unit = str(match.iloc[0]["Unit"])
             pcat = str(match.iloc[0].get("Product Category", ""))
@@ -534,9 +539,9 @@ def page_admin_orders():
             if st.button("Send counter", use_container_width=True):
                 try:
                     # Validate at least one Sell Price changed
-                    orig = lines.set_index("line_no")["Sell Price"].astype(float)
-                    new = edited.set_index("line_no")["Sell Price"].astype(float)
-            
+                    orig = pd.to_numeric(lines.set_index("line_no")["Sell Price"], errors="coerce").fillna(0.0)
+                    new = pd.to_numeric(edited.set_index("line_no")["Sell Price"], errors="coerce").fillna(0.0)
+
                     if (orig == new).all():
                         st.warning("No Sell Price changes detected. Change at least one line to send a counter.")
                         return
