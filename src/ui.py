@@ -244,8 +244,21 @@ def page_trader_orders():
     lines = get_order_lines(order_id)
     actions = get_order_actions(order_id)
 
-    st.markdown("### Order header")
-    st.write(header)
+    st.markdown("### Order summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Order", header["order_id"][:8])
+    c2.metric("Status", header["status"])
+    c3.metric("Snapshot", header["supplier_snapshot_id"][:8] if header.get("supplier_snapshot_id") else "")
+    c4.metric("Created (UTC)", str(header["created_at_utc"])[:19])
+    
+    if header.get("trader_note"):
+        st.caption(f"Trader note: {header['trader_note']}")
+    if header.get("admin_note"):
+        st.caption(f"Admin note: {header['admin_note']}")
+    
+    with st.expander("Show technical details", expanded=False):
+        st.json(header)
 
     st.markdown("### Lines")
     st.dataframe(lines, use_container_width=True, hide_index=True)
@@ -417,8 +430,21 @@ def page_admin_orders():
     lines = get_order_lines(order_id)
     actions = get_order_actions(order_id)
 
-    st.markdown("### Order header")
-    st.write(header)
+    st.markdown("### Order summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Order", header["order_id"][:8])
+    c2.metric("Status", header["status"])
+    c3.metric("Trader", header["created_by"])
+    c4.metric("Created (UTC)", str(header["created_at_utc"])[:19])
+    
+    if header.get("trader_note"):
+        st.caption(f"Trader note: {header['trader_note']}")
+    if header.get("admin_note"):
+        st.caption(f"Admin note: {header['admin_note']}")
+    
+    with st.expander("Show technical details", expanded=False):
+        st.json(header)
 
     st.markdown("### Lines")
     st.dataframe(lines, use_container_width=True, hide_index=True)
