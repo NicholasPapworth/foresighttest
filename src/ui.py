@@ -139,11 +139,6 @@ def page_trader_best_prices():
         "Product Category": "Category",
         "Delivery Window": "Window",
     })
-
-    show = view.rename(columns={
-        "Product Category": "Category",
-        "Delivery Window": "Window",
-    })
     
     st.dataframe(
         show[["Category", "Product", "Location", "Window", "Best Price", "Unit", "Supplier"]],
@@ -258,11 +253,10 @@ def page_trader_pricing():
         st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
 
     st.markdown("### Totals")
-    st.write({
-        "Base cost (sell)": res["base_cost"],
-        "Small-lot total": res["lot_charge_total"],
-        "Grand total": res["total"],
-    })
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Base cost (sell)", f"£{float(res['base_cost']):,.2f}")
+    c2.metric("Small-lot total", f"£{float(res['lot_charge_total']):,.2f}")
+    c3.metric("Grand total", f"£{float(res['total']):,.2f}")
 
     st.divider()
     st.markdown("### Checkout")
@@ -364,7 +358,11 @@ def page_trader_orders():
     st.dataframe(lines, use_container_width=True, hide_index=True)
 
     sell_total = float((lines["Sell Price"] * lines["Qty"]).sum())
-    st.write({"Sell value": sell_total})
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sell value", f"£{sell_total:,.2f}")
+    c2.metric("Lines", int(len(lines)))
+    c3.metric("Total tonnes", f"{float(lines['Qty'].sum()):,.2f} t")
 
     st.markdown("### Timeline")
     st.dataframe(actions[["action_type", "action_at_utc", "action_by"]], use_container_width=True, hide_index=True)
@@ -546,7 +544,14 @@ def page_admin_orders():
     gross_margin = float(((lines["Sell Price"] - lines["Base Price"]) * lines["Qty"]).sum())
     sell_value = float((lines["Sell Price"] * lines["Qty"]).sum())
     base_value = float((lines["Base Price"] * lines["Qty"]).sum())
-    st.write({"Sell value": sell_value, "Base value": base_value, "Gross margin": gross_margin})
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sell value", f"£{sell_value:,.2f}")
+    c2.metric("Base value", f"£{base_value:,.2f}")
+    c3.metric("Gross margin", f"£{gross_margin:,.2f}")
+    
+    gm_pct = (gross_margin / sell_value * 100.0) if sell_value else 0.0
+    c4.metric("GM %", f"{gm_pct:.2f}%")
 
     st.markdown("### Timeline")
     st.dataframe(actions[["action_type", "action_at_utc", "action_by"]], use_container_width=True, hide_index=True)
