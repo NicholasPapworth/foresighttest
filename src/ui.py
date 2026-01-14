@@ -836,7 +836,7 @@ def page_admin_blotter():
     df["sell_value"] = df["Sell Price"] * df["Qty"]
     df["base_value"] = df["Base Price"] * df["Qty"]
     df["gross_margin"] = df["sell_value"] - df["base_value"]
-    df["gm_pct"] = df["gross_margin"] / df["sell_value"]
+    df["gm_pct"] = (df["gross_margin"] / df["sell_value"]) * 100.0
     df["gm_pct"] = df["gm_pct"].where(df["sell_value"] != 0, 0.0)
 
     # ---- Filters (top row) ----
@@ -912,7 +912,7 @@ def page_admin_blotter():
         )
         .reset_index()
     )
-    agg["gm_pct"] = agg["gross_margin"] / agg["sell_value"]
+    agg["gm_pct"] = (agg["gross_margin"] / agg["sell_value"]) * 100.0
     agg["gm_pct"] = agg["gm_pct"].where(agg["sell_value"] != 0, 0.0)
 
     agg = agg.sort_values("gross_margin", ascending=False)
