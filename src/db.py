@@ -42,7 +42,7 @@ def init_db():
     );
     """)
 
-        # --- Admin margins (category/product) ---
+    # --- Admin margins (category/product) ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS price_margins (
         margin_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +220,65 @@ def save_small_lot_tiers(df: pd.DataFrame):
     """
     work = df.copy()
 
+    # Require these columns
+    for col in ["min_t", "charge_per_t"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in tiers editor.")
+
+    work["min_t"] = pd.to_numeric(work["min_t"], errors="raise")
+    work["charge_per_t"] = pd.to_numeric(work["charge_per_t"], errors="raise")
+
+    if "max_t" not in work.columns:
+        work["max_t"] = None
+    work["max_t"] = work["max_t"].apply(lambda x: None if x == "" or pd.isna(x) else float(x))
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+
+    tiers = work.sort_values("min_t").reset_index(drop=True)
+
+    # Validate min < max where max exists
+    for i in range(len(tiers)):
+        mn = float(tiers.loc[i, "min_t"])
+        mx = tiers.loc[i, "max_t"]
+        if mx is not None and mn >= float(mx):
+            raise ValueError(f"Invalid tier: min_t {mn} must be < max_t {mx}")
+
+    # Validate no overlaps among active tiers
+    active = tiers[tiers["active"] == 1].copy().sort_values("min_t").reset_index(drop=True)
+
+    def _end(row):
+        return float(row["max_t"]) if row["max_t"] is not None else float("inf")
+
+    for i in range(len(active) - 1):
+        if _end(active.loc[i]) >= float(active.loc[i + 1, "min_t"]):
+            raise ValueError("Overlapping active tiers detected. Adjust min/max so tiers do not overlap.")
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM small_lot_tiers;")
+
+    rows = []
+    for r in tiers.to_dict("records"):
+        rows.append((
+            float(r["min_t"]),
+            r["max_t"],
+            float(r["charge_per_t"]),
+            int(r["active"]),
+        ))
+
+    cur.executemany("""
+        INSERT INTO small_lot_tiers (min_t, max_t, charge_per_t, active)
+        VALUES (?, ?, ?, ?)
+    """, rows)
+
+    c.commit()
+    c.close()
+
+
+# ----------------- Margins -----------------
+
 def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str):
     scope_type = str(scope_type).strip().lower()
     if scope_type not in ("category", "product"):
@@ -291,65 +350,10 @@ def get_effective_margins() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["scope_type", "scope_value", "margin_per_t"])
 
-    # Keep most recent entry per (scope_type, scope_value)
     df = df.drop_duplicates(subset=["scope_type", "scope_value"], keep="first")
     return df[["scope_type", "scope_value", "margin_per_t"]]
 
-    # Require these columns
-    for col in ["min_t", "charge_per_t"]:
-        if col not in work.columns:
-            raise ValueError(f"Missing column '{col}' in tiers editor.")
 
-    work["min_t"] = pd.to_numeric(work["min_t"], errors="raise")
-    work["charge_per_t"] = pd.to_numeric(work["charge_per_t"], errors="raise")
-
-    if "max_t" not in work.columns:
-        work["max_t"] = None
-    work["max_t"] = work["max_t"].apply(lambda x: None if x == "" or pd.isna(x) else float(x))
-
-    if "active" not in work.columns:
-        work["active"] = 1
-    work["active"] = work["active"].apply(lambda x: 1 if str(x).strip() in ("1", "True", "true") else 0)
-
-    tiers = work.sort_values("min_t").reset_index(drop=True)
-
-    # Validate min < max where max exists
-    for i in range(len(tiers)):
-        mn = float(tiers.loc[i, "min_t"])
-        mx = tiers.loc[i, "max_t"]
-        if mx is not None and mn >= float(mx):
-            raise ValueError(f"Invalid tier: min_t {mn} must be < max_t {mx}")
-
-    # Validate no overlaps among active tiers
-    active = tiers[tiers["active"] == 1].copy().sort_values("min_t").reset_index(drop=True)
-
-    def _end(row):
-        return float(row["max_t"]) if row["max_t"] is not None else float("inf")
-
-    for i in range(len(active) - 1):
-        if _end(active.loc[i]) >= float(active.loc[i + 1, "min_t"]):
-            raise ValueError("Overlapping active tiers detected. Adjust min/max so tiers do not overlap.")
-
-    c = conn()
-    cur = c.cursor()
-    cur.execute("DELETE FROM small_lot_tiers;")
-
-    rows = []
-    for r in tiers.to_dict("records"):
-        rows.append((
-            float(r["min_t"]),
-            r["max_t"],
-            float(r["charge_per_t"]),
-            int(r["active"]),
-        ))
-
-    cur.executemany("""
-        INSERT INTO small_lot_tiers (min_t, max_t, charge_per_t, active)
-        VALUES (?, ?, ?, ?)
-    """, rows)
-
-    c.commit()
-    c.close()
 
 
 
