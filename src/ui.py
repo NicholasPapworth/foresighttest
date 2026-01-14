@@ -50,7 +50,7 @@ def _get_latest_prices_df():
 
 
 def page_trader_pricing():
-    st.subheader("Trader — Pricing")
+    st.subheader("Trader | Pricing")
 
     sid, df = _get_latest_prices_df()
     if df is None:
