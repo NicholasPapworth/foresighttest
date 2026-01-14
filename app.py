@@ -19,24 +19,41 @@ if not require_login():
 
 render_header()
 
-# Navigation
-pages = {
+# --- Navigation (grouped) ---
+with st.sidebar:
+    st.markdown("### Navigation")
+
+    st.markdown("**Trader**")
+    trader_choice = st.radio(
+        "",
+        ["Pricing", "Best Prices", "Orders", "History"],
+        key="nav_trader"
+    )
+
+    admin_choice = None
+    if st.session_state.get("role") == "admin":
+        st.markdown("---")
+        st.markdown("**Admin**")
+        admin_choice = st.radio(
+            "",
+            ["Admin Pricing", "Admin Orders"],
+            key="nav_admin"
+        )
+
+# --- Route ---
+routes = {
     "Pricing": page_trader_pricing,
     "Best Prices": page_trader_best_prices,
     "Orders": page_trader_orders,
     "History": page_history,
+    "Admin Pricing": page_admin_pricing,
+    "Admin Orders": page_admin_orders,
 }
 
-# Admin pages (only show in nav if admin)
-if st.session_state.get("role") == "admin":
-    pages["Admin Pricing"] = page_admin_pricing
-    pages["Admin Orders"] = page_admin_orders
+# If admin radio exists and is selected, use it; otherwise use trader selection
+choice = admin_choice if (admin_choice is not None) else trader_choice
+routes[choice]()
 
-with st.sidebar:
-    st.markdown("### Navigation")
-    choice = st.radio("", list(pages.keys()))
-
-pages[choice]()
 
 
 
