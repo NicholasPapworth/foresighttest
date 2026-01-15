@@ -20,7 +20,7 @@ st.set_page_config(page_title="Foresight Pricing", layout="wide")
 
 # --- Splash handling (must come immediately after set_page_config) ---
 SPLASH_SECONDS = 4.8
-SPLASH_PATH = "assets/foresight_intro.mp4"
+SPLASH_PATH = "assets/boot.mp4"
 
 if "boot_start" not in st.session_state and not st.session_state.get("booted", False):
     st.session_state["boot_start"] = time.time()
