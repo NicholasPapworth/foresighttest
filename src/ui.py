@@ -39,15 +39,19 @@ import time
 import base64
 from pathlib import Path
 import streamlit as st
+import streamlit.components.v1 as components
 
 def show_boot_splash(video_path: str | None = None, seconds: float = 4.8):
     """
     Full-screen splash video ONCE per session.
-    Autoplays, no controls, true fullscreen overlay, then disappears.
+    Autoplay, no controls, full screen, shows for `seconds`, then disappears cleanly.
     """
     if st.session_state.get("booted", False):
         return
 
+    # Prevent re-entry during Streamlit reruns
+    if st.session_state.get("_booting", False):
+        return
     st.session_state["_booting"] = True
 
     if not video_path:
@@ -66,53 +70,115 @@ def show_boot_splash(video_path: str | None = None, seconds: float = 4.8):
         return
 
     b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+    ms = int(seconds * 1000)
+
+    # IMPORTANT: do NOT fullscreen all iframes globally.
+    # We fullscreen only the iframe that contains this component by styling its parent wrapper.
+    html = f"""
+    <div id="splash-root"></div>
+
+    <style>
+      /* Fullscreen overlay INSIDE the component iframe */
+      html, body {{
+        margin: 0; padding: 0;
+        width: 100%; height: 100%;
+        background: #000;
+        overflow: hidden;
+      }}
+      #boot-splash {{
+        position: fixed;
+        inset: 0;
+        background: #000;
+        z-index: 2147483647;
+      }}
+      #boot-splash video {{
+        position: absolute;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        object-fit: cover;
+      }}
+    </style>
+
+    <div id="boot-splash">
+      <video id="splashVid" muted autoplay playsinline preload="auto"
+             disablepictureinpicture
+             controlslist="nodownload noremoteplayback noplaybackrate"
+      >
+        <source src="data:video/mp4;base64,{b64}" type="video/mp4" />
+      </video>
+    </div>
+
+    <script>
+      const v = document.getElementById("splashVid");
+
+      // Autoplay hardening
+      const tryPlay = () => {{
+        try {{
+          const p = v.play();
+          if (p && p.catch) p.catch(() => {{}});
+        }} catch (e) {{}}
+      }};
+      v.addEventListener("canplay", tryPlay);
+      v.addEventListener("loadeddata", tryPlay);
+      tryPlay();
+
+      // After duration: remove overlay AND hide the *component iframe* in the parent document
+      setTimeout(() => {{
+        try {{
+          const overlay = document.getElementById("boot-splash");
+          if (overlay) overlay.remove();
+
+          // Find our iframe in parent and hide it (this is the critical bit)
+          const frameEl = window.frameElement;
+          if (frameEl) {{
+            frameEl.style.display = "none";
+            frameEl.style.width = "0";
+            frameEl.style.height = "0";
+            frameEl.style.border = "0";
+          }}
+        }} catch (e) {{}}
+      }}, {ms});
+    </script>
+    """
+
+    # Render the component with a small height; we will force fullscreen via parent CSS below
     holder = st.empty()
 
+    # Fullscreen ONLY this component iframe by styling its container.
+    # We target the *most recent* iframe by placing the style right before components.html
     holder.markdown(
-        f"""
+        """
         <style>
-          /* Hide Streamlit chrome while splash is active */
-          header, footer {{ display: none !important; }}
-          [data-testid="stSidebar"] {{ display: none !important; }}
-          [data-testid="stAppViewContainer"] {{ background: #000 !important; }}
-          .block-container {{ padding-top: 0rem !important; }}
+          /* Make the component iframe fullscreen while it exists */
+          div[data-testid="stHtml"] iframe {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            border: 0 !important;
+            z-index: 2147483647 !important;
+            background: #000 !important;
+          }
 
-          /* Fullscreen overlay */
-          #boot-splash-overlay {{
-            position: fixed;
-            inset: 0;
-            width: 100vw;
-            height: 100vh;
-            z-index: 2147483647;
-            background: #000;
-            margin: 0;
-            padding: 0;
-          }}
-
-          /* Fullscreen video */
-          #boot-splash-overlay video {{
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            background: #000;
-            /* stops accidental interaction / showing controls on click */
-            pointer-events: none;
-          }}
+          /* Hide Streamlit chrome during splash */
+          header {visibility: hidden;}
+          footer {visibility: hidden;}
+          [data-testid="stSidebar"] {display: none;}
+          html, body {overflow: hidden; background: #000;}
         </style>
-
-        <div id="boot-splash-overlay">
-          <video autoplay muted playsinline preload="auto">
-            <source src="data:video/mp4;base64,{b64}" type="video/mp4" />
-          </video>
-        </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Prevent the rest of the app from rendering underneath
-    st.stop()
+    components.html(html, height=1, width=1)
+
+    # Block app rendering until splash elapsed, then rerun into normal UI
+    time.sleep(seconds)
+    st.session_state["booted"] = True
+    st.session_state["_booting"] = False
+    holder.empty()
+    st.rerun()
 
 # ---------------------------
 # Product books (Fertiliser vs Seed)
