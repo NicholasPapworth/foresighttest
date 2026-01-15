@@ -2,7 +2,7 @@ import streamlit as st
 from src.db import init_db
 from src.auth import require_login
 from src.ui import (
-    show_boot_splash,   # <-- add this
+    show_boot_splash,
     render_header,
     render_presence_panel,
     page_trader_pricing,
