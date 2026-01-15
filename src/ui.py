@@ -34,102 +34,112 @@ from src.pricing import apply_margins
 
 LOGO_PATH = "assets/logo.svg"
 
+import base64
+from pathlib import Path
+import streamlit as st
+import streamlit.components.v1 as components
+
 def show_boot_splash(video_path: str | None = None, seconds: float = 4.8, show_text: bool = False):
     """
-    Full-screen splash once per session, displayed for `seconds`.
-    Time-gated + autorefresh. No iframe, no JS.
+    Full-screen splash once per session.
+    Client-side JS removes the overlay after `seconds`.
+    Does NOT depend on reruns / streamlit-autorefresh.
     """
-
-    BOOTED_KEY = "booted_splash_v1"
-    START_KEY = "boot_start_splash_v1"
-
-    # Already done this session
-    if st.session_state.get(BOOTED_KEY, False):
+    KEY = "booted_splash_v2"
+    if st.session_state.get(KEY, False):
         return
-
-    # Start time
-    if START_KEY not in st.session_state:
-        st.session_state[START_KEY] = time.time()
-
-    elapsed = time.time() - st.session_state[START_KEY]
-
-    # Finished → mark done, clean up, rerun to continue app normally
-    if elapsed >= seconds:
-        st.session_state[BOOTED_KEY] = True
-        st.session_state.pop(START_KEY, None)
-        st.rerun()
-
-    # While active, keep rerunning so elapsed advances without sleep
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=100, key="boot_splash_refresh")
-    except Exception:
-        # If not installed: pip install streamlit-autorefresh
-        pass
+    st.session_state[KEY] = True
 
     video_tag = ""
     if video_path:
         p = Path(video_path)
         if not p.exists():
+            # if ui.py is in src/, resolve relative to project root
             p = Path(__file__).resolve().parent.parent / video_path
 
         with open(p, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # IMPORTANT: no "loop" so it doesn't repeat
+        # no loop → do not repeat
         video_tag = f"""
-        <video class="splash-video" autoplay muted playsinline preload="auto">
-            <source src="data:video/mp4;base64,{b64}" type="video/mp4">
+        <video id="splashVideo" class="splash-video" autoplay muted playsinline preload="auto">
+          <source src="data:video/mp4;base64,{b64}" type="video/mp4">
         </video>
         """
 
-    text_tag = '<div class="logo">Foresight</div>' if show_text else ""
+    text_tag = '<div class="splash-logo">Foresight</div>' if show_text else ""
 
-    st.markdown(
-        f"""
-        <style>
-          .boot-splash {{
-            position: fixed;
-            inset: 0;
-            z-index: 999999;
-            background: #000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-          }}
-          .boot-splash video {{
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            opacity: 0.95;
-          }}
-          .boot-splash .logo {{
-            position: relative;
-            font-size: 42px;
-            font-weight: 700;
-            color: #fff;
-            letter-spacing: 0.5px;
-            animation: pop 900ms ease-out forwards;
-          }}
-          @keyframes pop {{
-            0%   {{ transform: scale(0.85); opacity: 0; }}
-            60%  {{ transform: scale(1.02); opacity: 1; }}
-            100% {{ transform: scale(1.0); opacity: 1; }}
-          }}
-        </style>
+    ms = int(seconds * 1000)
 
-        <div class="boot-splash">
-          {video_tag}
-          {text_tag}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    html = f"""
+    <style>
+      /* Ensure the component itself never shows stray margins/scrollbars */
+      html, body {{
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        background: transparent !important;
+      }}
 
-    # Don’t render the rest of the app underneath
-    st.stop()
+      #boot-splash {{
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }}
+
+      .splash-video {{
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        opacity: 0.98;
+      }}
+
+      .splash-logo {{
+        position: relative;
+        font-size: 42px;
+        font-weight: 700;
+        color: #fff;
+        letter-spacing: 0.5px;
+        animation: pop 900ms ease-out forwards;
+      }}
+
+      @keyframes pop {{
+        0%   {{ transform: scale(0.85); opacity: 0; }}
+        60%  {{ transform: scale(1.02); opacity: 1; }}
+        100% {{ transform: scale(1.0); opacity: 1; }}
+      }}
+    </style>
+
+    <div id="boot-splash">
+      {video_tag}
+      {text_tag}
+    </div>
+
+    <script>
+      // Some browsers can still delay autoplay; force a play attempt.
+      try {{
+        const v = document.getElementById("splashVideo");
+        if (v) {{
+          v.play().catch(() => {{}});
+        }}
+      }} catch (e) {{}}
+
+      // Remove after the requested duration
+      setTimeout(() => {{
+        const el = document.getElementById("boot-splash");
+        if (el) el.remove();
+      }}, {ms});
+    </script>
+    """
+
+    # Keep a tiny iframe; overlay is fixed so it covers the full viewport.
+    components.html(html, height=1, width=1)
 
 # ---------------------------
 # Product books (Fertiliser vs Seed)
