@@ -2,10 +2,11 @@ import io
 import pandas as pd
 
 REQUIRED = ["Supplier", "Product", "Delivery Window", "Price", "Unit"]
-SHEET = "SUPPLIER_PRICES"
+SUPPLIER_SHEET = "SUPPLIER_PRICES"
+SEED_SHEET = "SEED_PRICES"
 UNIQUE_KEY = ["Supplier", "Product", "Location", "Delivery Window"]
 
-def load_supplier_sheet(content: bytes) -> pd.DataFrame:
+def load_supplier_SUPPLIER_SHEET(content: bytes) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(content))
     if SHEET not in xls.sheet_names:
         raise ValueError(f"Workbook must contain a sheet named '{SHEET}'. Found: {xls.sheet_names}")
@@ -42,8 +43,7 @@ def load_supplier_sheet(content: bytes) -> pd.DataFrame:
 
     return df[["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Unit"]]
 
-SEED_SHEET = "SEED_PRICES"   # <-- decide your seed sheet name
-# If you want same sheet name for seed too, set this to "SUPPLIER_PRICES"
+SEED_SHEET = "SEED_PRICES"
 
 def load_seed_sheet(content: bytes) -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(content))
@@ -79,7 +79,6 @@ def load_seed_sheet(content: bytes) -> pd.DataFrame:
             "Duplicate rows found for key (Supplier+Product+Location+Delivery Window). Fix:\n"
             f"{bad.head(50)}"
         )
-
     return df[["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Unit"]]
 
 
