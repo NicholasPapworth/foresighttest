@@ -43,7 +43,9 @@ BOOKS = {
         "list_snapshots": list_supplier_snapshots,
         "load_prices": load_supplier_prices,
         "publish_snapshot": publish_supplier_snapshot,
-        "upload_label": "Upload supplier prices (FERTILISER)",
+        "loader": load_supplier_sheet,
+        "upload_label": "Upload fertiliser prices (SUPPLIER_PRICES)",
+        "publish_button": "Publish fertiliser snapshot",
     },
     "Seed": {
         "code": "seed",
@@ -51,9 +53,13 @@ BOOKS = {
         "list_snapshots": list_seed_snapshots,
         "load_prices": load_seed_prices,
         "publish_snapshot": publish_seed_snapshot,
-        "upload_label": "Upload supplier prices (SEED)",
+        "loader": load_seed_sheet,
+        "upload_label": "Upload seed prices (SEED_PRICES)",
+        "publish_button": "Publish seed snapshot",
     },
 }
+
+BOOKS_BY_CODE = {v["code"]: v for v in BOOKS.values()}
 
 
 def _ss_key(book_code: str, name: str) -> str:
@@ -76,10 +82,6 @@ def _ensure_basket_for(book_code: str):
     if bkey not in st.session_state:
         st.session_state[bkey] = []
         st.session_state[tkey] = time.time()
-
-
-# Build reverse lookup once
-BOOKS_BY_CODE = {v["code"]: v for v in BOOKS.values()}
 
 
 def render_header():
@@ -294,6 +296,10 @@ def _page_trader_pricing_impl(book_code: str):
         placeholder="Customer/account, terms, anything relevant.",
         key=_ss_key(book_code, "trader_note")
     )
+
+    if book_code == "seed":
+    st.info("Seed ordering is not enabled yet. You can view and optimise seed pricing, but submitting seed orders is disabled until the database is updated to separate Seed vs Fertiliser orders.")
+    return
 
     if st.button("Submit order to Admin", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_submit")):
         alloc_lines = []
@@ -528,19 +534,32 @@ def _page_admin_pricing_impl(book_code: str):
 
     st.markdown(f"### {BOOKS_BY_CODE[book_code]['upload_label']}")
     up = st.file_uploader("Upload Excel", type=["xlsx"], key=_ss_key(book_code, "upload_excel"))
+    
     if up:
         content = up.read()
         try:
-            df = load_supplier_sheet(content)
+            # IMPORTANT: book-specific validation (Fert vs Seed)
+            df = BOOKS_BY_CODE[book_code]["loader"](content)
+    
             st.success("Validated. Preview:")
             st.dataframe(df, use_container_width=True, hide_index=True)
-
-            if st.button("Publish supplier snapshot", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_publish")):
-                sid = BOOKS_BY_CODE[book_code]["publish_snapshot"](df, st.session_state.get("user", "unknown"), content)
-                st.success(f"Published supplier snapshot: {sid}")
+    
+            if st.button(
+                BOOKS_BY_CODE[book_code]["publish_button"],
+                type="primary",
+                use_container_width=True,
+                key=_ss_key(book_code, "btn_publish")
+            ):
+                sid = BOOKS_BY_CODE[book_code]["publish_snapshot"](
+                    df,
+                    st.session_state.get("user", "unknown"),
+                    content
+                )
+                st.success(f"Published snapshot: {sid}")
                 st.rerun()
+    
         except Exception as e:
-            st.error(str(e))
+        st.error(str(e))
 
 def page_admin_orders():
     if st.session_state.get("role") != "admin":
