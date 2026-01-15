@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import uuid
 import base64
+import streamlit.components.v1 as components
 from pathlib import Path
 from datetime import datetime, timezone
 from src.db import presence_heartbeat, list_online_users
@@ -38,69 +39,138 @@ import time
 from pathlib import Path
 import streamlit as st
 
+import time
+import base64
+from pathlib import Path
+import streamlit as st
+import streamlit.components.v1 as components
+
 def show_boot_splash(video_path: str | None = None, seconds: float = 4.8):
     """
     Full-screen splash video ONCE per session.
-    Reliable approach: st.video + temporary fullscreen CSS + short sleep.
+    Clean overlay (no controls), autoplay, then disappears.
     """
+    # Already finished
     if st.session_state.get("booted", False):
         return
 
-    # Mark as done BEFORE sleeping to avoid replay on reruns
-    st.session_state["booted"] = True
+    Fletcher = st.session_state.get("_booting", False)
+    if Fletcher:
+        return
+
+    st.session_state["_booting"] = True  # prevent accidental re-entry
 
     if not video_path:
+        st.session_state["booted"] = True
+        st.session_state["_booting"] = False
         return
 
     p = Path(video_path)
     if not p.exists():
-        # if ui.py is in src/, resolve relative to project root
         p = Path(__file__).resolve().parent.parent / video_path
 
     if not p.exists():
+        st.session_state["booted"] = True
+        st.session_state["_booting"] = False
         st.error(f"Splash video not found: {p}")
         return
 
-    holder = st.empty()
+    # Base64 encode the mp4 (inside the component iframe only)
+    b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+    ms = int(seconds * 1000)
 
-    # Fullscreen the Streamlit st.video element while splash is shown
-    holder.markdown(
+    # Make the component iframe fullscreen (this CSS is in the main Streamlit DOM)
+    st.markdown(
         """
         <style>
-          /* Hide Streamlit chrome while splash is active */
-          header {visibility: hidden;}
-          footer {visibility: hidden;}
-          [data-testid="stSidebar"] {visibility: hidden;}
-
-          /* Make the st.video container fullscreen */
-          div[data-testid="stVideo"] {
+          /* Fullscreen ANY iframe while splash is running (safe because we st.stop()) */
+          .block-container { padding-top: 0rem; }
+          div[data-testid="stHtml"] iframe,
+          div[data-testid="stIFrame"] iframe,
+          iframe {
             position: fixed !important;
             inset: 0 !important;
             width: 100vw !important;
             height: 100vh !important;
+            border: 0 !important;
             z-index: 2147483647 !important;
             background: #000 !important;
-            margin: 0 !important;
-            padding: 0 !important;
           }
-
-          /* Make the <video> fill the screen */
-          div[data-testid="stVideo"] video {
-            width: 100% !important;
-            height: 100% !important;
-            object-fit: cover !important;
-          }
+          header, footer { visibility: hidden; }
+          [data-testid="stSidebar"] { display: none; }
+          html, body { overflow: hidden; background: #000; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    # Streamlit-served video (do NOT base64-embed)
-    holder.video(str(p), start_time=0)
+    # Render a raw <video> without controls, and force autoplay with JS fallback.
+    html = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          html, body {{
+            margin: 0; padding: 0;
+            width: 100%; height: 100%;
+            background: #000; overflow: hidden;
+          }}
+          video {{
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            background: #000;
+          }}
+        </style>
+      </head>
+      <body>
+        <video id="splashVid" muted autoplay playsinline preload="auto"
+               disablepictureinpicture
+               controlslist="nodownload noremoteplayback noplaybackrate"
+        >
+          <source src="data:video/mp4;base64,{b64}" type="video/mp4" />
+        </video>
 
-    # Hold splash for desired duration, then remove and rerun into the app
+        <script>
+          const v = document.getElementById("splashVid");
+
+          // Ensure autoplay actually starts (some browsers need an explicit play call)
+          const tryPlay = () => {{
+            try {{
+              const p = v.play();
+              if (p && p.catch) p.catch(() => {{}});
+            }} catch (e) {{}}
+          }};
+
+          v.addEventListener("canplay", tryPlay);
+          v.addEventListener("loadeddata", tryPlay);
+          tryPlay();
+
+          // Hard stop & blank out after duration so it never sticks on final frame
+          setTimeout(() => {{
+            try {{
+              v.pause();
+              v.removeAttribute("src");
+              v.load();
+              document.body.innerHTML = "";
+              document.body.style.background = "#000";
+            }} catch (e) {{}}
+          }}, {ms});
+        </script>
+      </body>
+    </html>
+    """
+
+    components.html(html, height=0, width=0)
+
+    # Block the rest of the app during splash
     time.sleep(seconds)
-    holder.empty()
+
+    st.session_state["booted"] = True
+    st.session_state["_booting"] = False
     st.rerun()
 
 # ---------------------------
