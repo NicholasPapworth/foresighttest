@@ -94,27 +94,25 @@ def render_header():
     with mid:
         st.markdown("## Foresight Pricing")
     with right:
-        snap = latest_supplier_snapshot()
-        if snap:
-            sid, ts, by = snap
-            st.caption(f"Latest supplier snapshot: {ts} UTC\nPublished by: {by}")
+        snap_f = latest_supplier_snapshot()
+        snap_s = latest_seed_snapshot()
+        
+        lines = []
+        if snap_f:
+            _, ts, by = snap_f
+            lines.append(f"Fertiliser: {ts} UTC (by {by})")
         else:
-            st.caption("No supplier snapshot published yet.")
+            lines.append("Fertiliser: none")
+        
+        if snap_s:
+            _, ts, by = snap_s
+            lines.append(f"Seed: {ts} UTC (by {by})")
+        else:
+            lines.append("Seed: none")
+        
+        st.caption("Latest snapshots:\n" + "\n".join(lines))
+
     st.divider()
-
-
-def _get_latest_prices_df():
-    snap = latest_supplier_snapshot()
-    if not snap:
-        return None, None
-    sid, ts, by = snap
-    df = load_supplier_prices(sid)
-    return sid, df
-
-def _ensure_basket():
-    if "basket" not in st.session_state:
-        st.session_state.basket = []
-        st.session_state.basket_created_at = time.time()
 
 def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -291,6 +289,13 @@ def _page_trader_pricing_impl(book_code: str):
     st.divider()
     st.markdown("### Checkout")
 
+    if book_code == "seed":
+        st.info(
+            "Seed ordering is not enabled yet. You can view and optimise seed pricing, "
+            "but submitting seed orders is disabled until the database is updated."
+        )
+        return
+
     trader_note = st.text_area(
         "Order note (optional)",
         placeholder="Customer/account, terms, anything relevant.",
@@ -298,8 +303,12 @@ def _page_trader_pricing_impl(book_code: str):
     )
 
     if book_code == "seed":
-    st.info("Seed ordering is not enabled yet. You can view and optimise seed pricing, but submitting seed orders is disabled until the database is updated to separate Seed vs Fertiliser orders.")
-    return
+        st.info(
+            "Seed ordering is not enabled yet. You can view and optimise seed pricing, "
+            "but submitting seed orders is disabled until the database is updated "
+            "to separate Seed vs Fertiliser orders."
+        )
+        return
 
     if st.button("Submit order to Admin", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_submit")):
         alloc_lines = []
@@ -559,7 +568,7 @@ def _page_admin_pricing_impl(book_code: str):
                 st.rerun()
     
         except Exception as e:
-        st.error(str(e))
+            st.error(str(e))
 
 def page_admin_orders():
     if st.session_state.get("role") != "admin":
