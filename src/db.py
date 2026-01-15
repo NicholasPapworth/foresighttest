@@ -1,6 +1,6 @@
 import sqlite3
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import uuid
 import json
@@ -55,7 +55,7 @@ def init_db():
     ON supplier_prices (snapshot_id, product, location, delivery_window);
     """)
 
-        # --- Seed snapshots (NEW, identical shape to supplier snapshots) ---
+    # --- Seed snapshots (NEW, identical shape to supplier snapshots) ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS seed_snapshots (
         snapshot_id TEXT PRIMARY KEY,
@@ -942,8 +942,6 @@ def admin_mark_filled(order_id: str, admin_user: str, expected_version: int | No
         expected_version=expected_version,
     )
 
-from datetime import timedelta
-
 def presence_heartbeat(user: str, role: str, page: str, session_id: str):
     """
     Upserts a presence heartbeat for this user+session.
@@ -1058,6 +1056,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
