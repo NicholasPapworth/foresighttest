@@ -324,7 +324,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
         ))
 
     cur.executemany("""
-        INSERT INTO supplier_prices
+        INSERT OR IGNORE INTO supplier_prices
         (snapshot_id, supplier, product_category, product, location, delivery_window, price, unit)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
@@ -1064,6 +1064,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
