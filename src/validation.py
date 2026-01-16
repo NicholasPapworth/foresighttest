@@ -32,7 +32,12 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
     for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category"]:
         df[c] = _clean_str(df[c])
 
-    df["Price"] = pd.to_numeric(df["Price"], errors="raise")
+    # Convert Price to numeric; blanks/non-numeric become NaN (we will drop them)
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    
+    # Drop rows where Price is missing / blank / non-numeric
+    df = df.dropna(subset=["Price"])
+
 
     # Drop blank required fields
     df = df[
