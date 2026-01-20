@@ -167,6 +167,28 @@ def _ss_key(book_code: str, name: str) -> str:
     """Namespaced session_state key so Fert and Seed don't clash."""
     return f"{book_code}__{name}"
 
+def _ensure_upload_has_sell_price(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures upload DF contains a numeric Sell Price column.
+    Expects upload DF shape from validation loaders:
+      Supplier, Product Category, Product, Location, Delivery Window, Price, Unit
+    """
+    work = df.copy()
+
+    if "Price" not in work.columns:
+        raise ValueError("Upload sheet must contain a 'Price' column.")
+
+    work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
+    work = work.dropna(subset=["Price"])
+
+    if "Sell Price" not in work.columns:
+        work["Sell Price"] = work["Price"]
+
+    work["Sell Price"] = pd.to_numeric(work["Sell Price"], errors="coerce")
+    work = work.dropna(subset=["Sell Price"])
+
+    return work
+
 
 def _get_latest_prices_df_for(book_code: str):
     snap = BOOKS_BY_CODE[book_code]["latest_snapshot"]()
@@ -266,10 +288,6 @@ def _page_trader_pricing_impl(book_code: str):
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
-
-    # Apply margins
-    margins = get_effective_margins()
-    df = apply_margins(df, margins)
 
     # Namespaced session keys
     basket_key = _ss_key(book_code, "basket")
@@ -642,33 +660,130 @@ def _page_admin_pricing_impl(book_code: str):
     st.divider()
 
     st.markdown(f"### {BOOKS_BY_CODE[book_code]['upload_label']}")
-    up = st.file_uploader("Upload Excel", type=["xlsx"], key=_ss_key(book_code, "upload_excel"))
+
+    # Namespaced session keys for preview workflow
+    preview_df_key = _ss_key(book_code, "admin_preview_df")
+    preview_bytes_key = _ss_key(book_code, "admin_preview_bytes")
+    preview_name_key = _ss_key(book_code, "admin_preview_filename")
     
-    if up:
+    upload_key = _ss_key(book_code, "upload_excel")
+    up = st.file_uploader("Upload Excel", type=["xlsx"], key=upload_key)
+    
+    # If a new file is uploaded, validate and store preview in session_state (do NOT publish yet)
+    if up is not None:
         content = up.read()
         try:
-            # IMPORTANT: book-specific validation (Fert vs Seed)
-            df = BOOKS_BY_CODE[book_code]["loader"](content)
+            df_raw = BOOKS_BY_CODE[book_code]["loader"](content)
+            df_raw = _ensure_upload_has_sell_price(df_raw)
     
-            st.success("Validated. Preview:")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-    
-            if st.button(
-                BOOKS_BY_CODE[book_code]["publish_button"],
-                type="primary",
-                use_container_width=True,
-                key=_ss_key(book_code, "btn_publish")
-            ):
-                sid = BOOKS_BY_CODE[book_code]["publish_snapshot"](
-                    df,
-                    st.session_state.get("user", "unknown"),
-                    content
-                )
-                st.success(f"Published snapshot: {sid}")
-                st.rerun()
-    
+            st.session_state[preview_df_key] = df_raw
+            st.session_state[preview_bytes_key] = content
+            st.session_state[preview_name_key] = getattr(up, "name", "")
+            st.success("Validated. Preview loaded. Review / apply margins / edit Sell Price, then publish below.")
         except Exception as e:
             st.error(str(e))
+    
+    # If we have a preview in session_state, show the preview workflow UI
+    if preview_df_key in st.session_state and st.session_state.get(preview_df_key) is not None:
+        dfp = st.session_state[preview_df_key].copy()
+    
+        st.caption(f"Preview file: {st.session_state.get(preview_name_key, '')}")
+        st.markdown("#### Preview (Base vs Sell)")
+    
+        # Controls
+        cA, cB, cC, cD = st.columns([1, 1, 1, 1])
+    
+        with cA:
+            if st.button("Apply current margins to Sell Price", use_container_width=True, key=_ss_key(book_code, "btn_apply_margins_preview")):
+                try:
+                    margins = get_effective_margins()
+    
+                    # apply_margins expects the loaded snapshot shape; adapt upload DF to that shape
+                    tmp = dfp.rename(columns={"Price": "Base Price"}).copy()
+                    tmp = apply_margins(tmp, margins)
+    
+                    dfp["Sell Price"] = pd.to_numeric(tmp["Sell Price"], errors="coerce")
+                    st.session_state[preview_df_key] = dfp
+                    st.success("Applied margins to Sell Price (preview).")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    
+        with cB:
+            if st.button("Reset Sell = Base", use_container_width=True, key=_ss_key(book_code, "btn_reset_sell_preview")):
+                dfp["Sell Price"] = pd.to_numeric(dfp["Price"], errors="coerce")
+                st.session_state[preview_df_key] = dfp
+                st.success("Sell Price reset to Base Price (preview).")
+                st.rerun()
+    
+        with cC:
+            if st.button("Clear preview", use_container_width=True, key=_ss_key(book_code, "btn_clear_preview")):
+                st.session_state[preview_df_key] = None
+                st.session_state[preview_bytes_key] = None
+                st.session_state[preview_name_key] = ""
+                # Attempt to clear uploader value as well
+                st.session_state[upload_key] = None
+                st.rerun()
+    
+        with cD:
+            st.write("")  # spacer
+    
+        # Editable preview: allow editing Sell Price only
+        editable_cols = []
+        for col in ["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Sell Price", "Unit"]:
+            if col in dfp.columns:
+                editable_cols.append(col)
+    
+        edited = st.data_editor(
+            dfp[editable_cols],
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=[c for c in editable_cols if c != "Sell Price"],
+            column_config={
+                "Price": st.column_config.NumberColumn("Base Price", format="£%.2f"),
+                "Sell Price": st.column_config.NumberColumn("Sell Price", min_value=0.0, step=0.5, format="£%.2f"),
+            },
+            key=_ss_key(book_code, "preview_editor")
+        )
+    
+        # Save edited Sell Price back to preview
+        # (data_editor returns a df; persist it)
+        st.session_state[preview_df_key] = edited.copy()
+    
+        st.divider()
+    
+        # Publish button (ONLY publish from preview)
+        if st.button(
+            BOOKS_BY_CODE[book_code]["publish_button"],
+            type="primary",
+            use_container_width=True,
+            key=_ss_key(book_code, "btn_publish_from_preview")
+        ):
+            try:
+                to_pub = st.session_state[preview_df_key].copy()
+                # Ensure numeric + non-null
+                to_pub["Price"] = pd.to_numeric(to_pub["Price"], errors="coerce")
+                to_pub["Sell Price"] = pd.to_numeric(to_pub["Sell Price"], errors="coerce")
+                to_pub = to_pub.dropna(subset=["Price", "Sell Price"])
+    
+                sid = BOOKS_BY_CODE[book_code]["publish_snapshot"](
+                    to_pub,
+                    st.session_state.get("user", "unknown"),
+                    st.session_state.get(preview_bytes_key, b"")
+                )
+    
+                st.success(f"Published snapshot: {sid}")
+    
+                # Clear preview after publish
+                st.session_state[preview_df_key] = None
+                st.session_state[preview_bytes_key] = None
+                st.session_state[preview_name_key] = ""
+                st.session_state[upload_key] = None
+    
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
 def page_admin_orders():
     if st.session_state.get("role") != "admin":
@@ -839,10 +954,8 @@ def _page_history_impl(book_code: str):
 
     df = BOOKS_BY_CODE[book_code]["load_prices"](sid)
 
-    margins = get_effective_margins()
-    df = apply_margins(df, margins)
-    df["Price"] = df["Sell Price"]
-    df = df.drop(columns=["Sell Price"], errors="ignore")
+    # Snapshot already contains Sell Price in DB; show both Base and Sell
+    # (No runtime margin application)
 
     q = st.text_input("Search", key=_ss_key(book_code, "hist_search"))
     if q:
@@ -865,9 +978,6 @@ def _page_trader_best_prices_impl(book_code: str):
     if df is None:
         st.warning("No supplier snapshot available. Admin must publish one.")
         return
-
-    margins = get_effective_margins()
-    df = apply_margins(df, margins)
 
     board = _best_prices_board(df)
 
