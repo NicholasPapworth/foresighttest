@@ -232,7 +232,7 @@ def render_header():
         else:
             lines.append("Seed: none")
         
-        st.caption("Latest snapshots:\n" + "\n".join(lines))
+        st.markdown("**Latest snapshots:**  \n" + "  \n".join(lines))
 
     st.divider()
 
@@ -480,13 +480,13 @@ def _page_trader_pricing_impl(book_code: str):
             })
 
         try:
+            user = st.session_state.get("user", "unknown")
             order_id = create_order_from_allocation(
-                created_by=st.session_state.user,
+                created_by=user,
                 supplier_snapshot_id=sid,
                 allocation_lines=alloc_lines,
                 trader_note=trader_note
             )
-
             st.session_state[basket_key] = []
             st.session_state[basket_created_key] = time.time()
             st.session_state[last_optim_key] = None
@@ -499,7 +499,7 @@ def _page_trader_pricing_impl(book_code: str):
 def page_trader_orders():
     st.subheader("Trader | Orders")
 
-    df = list_orders_for_user(st.session_state.user)
+    df = list_orders_for_user(user = st.session_state.get("user", "unknown"))
     if df.empty:
         st.info("No orders yet.")
         return
@@ -551,7 +551,7 @@ def page_trader_orders():
     if header["status"] in ("PENDING", "COUNTERED"):
         if st.button("Cancel order", use_container_width=True):
             try:
-                trader_cancel_order(order_id, st.session_state.user, expected_version=header["version"])
+                trader_cancel_order(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
                 st.success("Order cancelled.")
                 st.rerun()
             except Exception as e:
@@ -562,7 +562,7 @@ def page_trader_orders():
         with c1:
             if st.button("Accept counter", type="primary", use_container_width=True):
                 try:
-                    trader_accept_counter(order_id, st.session_state.user, expected_version=header["version"])
+                    trader_accept_counter(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
                     st.success("Counter accepted. Order is now CONFIRMED.")
                     st.rerun()
                 except Exception as e:
@@ -937,7 +937,7 @@ def page_admin_orders():
         with c1:
             if st.button("Confirm as-is", type="primary", use_container_width=True):
                 try:
-                    admin_confirm_order(order_id, st.session_state.user, expected_version=header["version"])
+                    admin_confirm_order(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
                     st.success("Order CONFIRMED.")
                     st.rerun()
                 except Exception as e:
@@ -956,7 +956,7 @@ def page_admin_orders():
             
                     admin_counter_order(
                         order_id,
-                        st.session_state.user,
+                        user = st.session_state.get("user", "unknown"),
                         edited_lines=edited,
                         admin_note=admin_note,
                         expected_version=header["version"]
@@ -969,7 +969,7 @@ def page_admin_orders():
         with c3:
             if st.button("Reject", use_container_width=True):
                 try:
-                    admin_reject_order(order_id, st.session_state.user, admin_note=admin_note, expected_version=header["version"])
+                    admin_reject_order(order_id, user = st.session_state.get("user", "unknown"), admin_note=admin_note, expected_version=header["version"])
                     st.success("Order REJECTED.")
                     st.rerun()
                 except Exception as e:
@@ -979,7 +979,7 @@ def page_admin_orders():
         st.markdown("### Fill")
         if st.button("Mark FILLED", type="primary", use_container_width=True):
             try:
-                admin_mark_filled(order_id, st.session_state.user, expected_version=header["version"])
+                admin_mark_filled(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
                 st.success("Order marked FILLED.")
                 st.rerun()
             except Exception as e:
