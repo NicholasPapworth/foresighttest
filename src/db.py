@@ -981,7 +981,7 @@ def trader_accept_counter(order_id: str, user: str, expected_version: int | None
     )
 
 
-def admin_confirm_order(order_id: str, admin_user: str, expected_version: int | None = None):
+def admin_confirm_order(order_id: str, admin_user: str, admin_note: str = "", expected_version: int | None = None):
     h = get_order_header(order_id)
     if not h:
         raise ValueError("Order not found.")
@@ -991,8 +991,9 @@ def admin_confirm_order(order_id: str, admin_user: str, expected_version: int | 
         action_type="CONFIRM",
         action_by=admin_user,
         expected_version=expected_version,
+        admin_note=admin_note,
+        payload={"admin_note": admin_note} if admin_note else None,
     )
-
 
 def admin_reject_order(order_id: str, admin_user: str, admin_note: str = "", expected_version: int | None = None):
     h = get_order_header(order_id)
@@ -1140,6 +1141,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
