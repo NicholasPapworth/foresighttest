@@ -398,20 +398,20 @@ def _page_trader_pricing_impl(book_code: str):
         st.markdown("### Small-lot charges")
         st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
 
-    st.markdown("### Totals")
+st.markdown("### Totals")
 
-    alloc_df = pd.DataFrame(res["allocation"])
-    tonnes = float(pd.to_numeric(alloc_df["Qty"], errors="coerce").fillna(0.0).sum()) if not alloc_df.empty else 0.0
-    tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
-    
-    base_per_t = float(res["base_cost"]) / tonnes
-    lot_per_t  = float(res["lot_charge_total"]) / tonnes
-    total_per_t = float(res["total"]) / tonnes
-    
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
-    c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
-    c3.metric("All-in £/t", f"£{total_per_t:,.2f}")
+alloc_df = pd.DataFrame(res["allocation"])
+tonnes = float(pd.to_numeric(alloc_df["Qty"], errors="coerce").fillna(0.0).sum()) if not alloc_df.empty else 0.0
+tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
+
+base_per_t = float(res["base_cost"]) / tonnes
+lot_per_t  = float(res["lot_charge_total"]) / tonnes
+total_per_t = float(res["total"]) / tonnes
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
+c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
+c3.metric("All-in £/t", f"£{total_per_t:,.2f}")
 
     st.divider()
     st.markdown("### Checkout")
