@@ -249,6 +249,24 @@ def set_setting(key: str, value: str):
     c.commit()
     c.close()
 
+def _snapshot_hash_from_df(df: pd.DataFrame) -> str:
+    cols = ["Supplier","Product Category","Product","Location","Delivery Window","Price","Sell Price","Unit"]
+    tmp = df.copy()
+    for c in cols:
+        if c not in tmp.columns:
+            tmp[c] = ""
+    tmp = tmp[cols].copy()
+
+    # normalise
+    for c in ["Supplier","Product Category","Product","Location","Delivery Window","Unit"]:
+        tmp[c] = tmp[c].fillna("").astype(str).str.strip().str.lower()
+
+    tmp["Price"] = pd.to_numeric(tmp["Price"], errors="coerce").fillna(0.0)
+    tmp["Sell Price"] = pd.to_numeric(tmp["Sell Price"], errors="coerce").fillna(0.0)
+
+    payload = tmp.to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
 
 # ---------------- Supplier snapshots ----------------
 
@@ -312,7 +330,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
 
     snapshot_id = str(uuid.uuid4())
     published_at = utc_now_iso()
-    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    source_hash = _snapshot_hash_from_df(work)
     row_count = int(len(work))
 
     c = conn()
@@ -423,7 +441,7 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
 
     snapshot_id = str(uuid.uuid4())
     published_at = utc_now_iso()
-    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    source_hash = _snapshot_hash_from_df(work)
     row_count = int(len(work))
 
     c = conn()
@@ -1110,6 +1128,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
