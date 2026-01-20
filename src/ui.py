@@ -667,6 +667,55 @@ def _page_admin_pricing_impl(book_code: str):
             st.error(str(e))
 
     st.divider()
+    
+    st.markdown("### Reprice (no upload)")
+
+    if st.button(
+        "Reprice latest snapshot using current margins and publish",
+        type="primary",
+        use_container_width=True,
+        key=_ss_key(book_code, "btn_reprice_latest")
+    ):
+        try:
+            # 1) Load latest snapshot for this book
+            sid_latest, df_latest = _get_latest_prices_df_for(book_code)
+            if df_latest is None or df_latest.empty:
+                st.error("No latest snapshot found to reprice.")
+                return
+
+            # 2) Apply margins to compute new Sell Price
+            margins = get_effective_margins()
+            tmp = df_latest.copy()
+
+            # Ensure Sell Price exists and starts from base
+            tmp["Price"] = pd.to_numeric(tmp["Price"], errors="coerce")
+            tmp["Sell Price"] = pd.to_numeric(tmp.get("Sell Price", tmp["Price"]), errors="coerce")
+            tmp["Sell Price"] = tmp["Price"]  # always recompute from base
+
+            tmp = apply_margins(tmp, margins)
+
+            # 3) Publish as a new snapshot
+            new_sid = BOOKS_BY_CODE[book_code]["publish_snapshot"](
+                tmp,
+                st.session_state.get("user", "unknown"),
+                b""  # no source file
+            )
+
+            st.success(f"Repriced and published new snapshot: {new_sid[:8]}")
+            st.rerun()
+
+        except ValueError as e:
+            # this will catch your duplicate source_hash message
+            msg = str(e)
+            if "duplicate source_hash" in msg.lower() or "already been published" in msg.lower():
+                st.warning(
+                    "No changes detected versus an existing published snapshot. "
+                    "Either margins didn’t change the Sell Prices, or the result matches a prior snapshot."
+                )
+            else:
+                st.error(msg)
+        except Exception as e:
+            st.error(str(e))
 
     st.markdown(f"### {BOOKS_BY_CODE[book_code]['upload_label']}")
 
