@@ -1075,15 +1075,15 @@ def _page_trader_best_prices_impl(book_code: str):
 
     st.divider()
 
-    st.dataframe(
-        view.rename(columns={"Product Category": "Category", "Delivery Window": "Window"})[
-            ["Category", "Product", "Location", "Window", "Best Price", "Unit", "Supplier"]
-        ],
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Best Price": st.column_config.NumberColumn("Best Price", format="£%.2f")},
-    )
-
+    with st.expander("Show full table", expanded=False):
+        st.dataframe(
+            view.rename(columns={"Product Category": "Category", "Delivery Window": "Window"})[
+                ["Category", "Product", "Location", "Window", "Best Price", "Unit", "Supplier"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Best Price": st.column_config.NumberColumn("Best Price", format="£%.2f")},
+        )
 # ---------------------------
 # Presence (sidebar widget)
 # ---------------------------
