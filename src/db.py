@@ -287,7 +287,7 @@ def load_supplier_prices(snapshot_id: str) -> pd.DataFrame:
           product AS "Product",
           location AS "Location",
           delivery_window AS "Delivery Window",
-          price AS "Base Price",
+          price AS "Price",
           COALESCE(sell_price, price) AS "Sell Price",
           unit AS "Unit"
         FROM supplier_prices
@@ -401,7 +401,7 @@ def load_seed_prices(snapshot_id: str) -> pd.DataFrame:
           product AS "Product",
           location AS "Location",
           delivery_window AS "Delivery Window",
-          price AS "Base Price",
+          price AS "Price",
           COALESCE(sell_price, price) AS "Sell Price",
           unit AS "Unit"
         FROM seed_prices
@@ -1112,6 +1112,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
