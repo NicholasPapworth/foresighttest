@@ -676,6 +676,18 @@ def _page_admin_pricing_impl(book_code: str):
     preview_name_key = _ss_key(book_code, "admin_preview_filename")
     
     upload_key = _ss_key(book_code, "upload_excel")
+    # --- uploader key token so we can reset safely ---
+    tok_key = _ss_key(book_code, "upload_token")
+    if tok_key not in st.session_state:
+        st.session_state[tok_key] = 0
+    
+    upload_key = _ss_key(book_code, f"upload_excel_{st.session_state[tok_key]}")
+    # --- uploader key token so we can reset safely ---
+    tok_key = _ss_key(book_code, "upload_token")
+    if tok_key not in st.session_state:
+        st.session_state[tok_key] = 0
+    
+    upload_key = _ss_key(book_code, f"upload_excel_{st.session_state[tok_key]}")
     up = st.file_uploader("Upload Excel", type=["xlsx"], key=upload_key)
     
     # If a new file is uploaded, validate and store preview in session_state (do NOT publish yet)
@@ -731,7 +743,7 @@ def _page_admin_pricing_impl(book_code: str):
                 st.session_state[preview_bytes_key] = None
                 st.session_state[preview_name_key] = ""
                 # Attempt to clear uploader value as well
-                st.session_state[upload_key] = None
+                st.session_state[tok_key] += 1
                 st.rerun()
     
         with cD:
@@ -788,8 +800,7 @@ def _page_admin_pricing_impl(book_code: str):
                 st.session_state[preview_df_key] = None
                 st.session_state[preview_bytes_key] = None
                 st.session_state[preview_name_key] = ""
-                st.session_state[upload_key] = None
-    
+                st.session_state[tok_key] += 1
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
