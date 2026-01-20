@@ -429,14 +429,6 @@ def _page_trader_pricing_impl(book_code: str):
         key=_ss_key(book_code, "trader_note")
     )
 
-    if book_code == "seed":
-        st.info(
-            "Seed ordering is not enabled yet. You can view and optimise seed pricing, "
-            "but submitting seed orders is disabled until the database is updated "
-            "to separate Seed vs Fertiliser orders."
-        )
-        return
-
     if st.button("Submit order to Admin", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_submit")):
         alloc_lines = []
         for r in res["allocation"]:
