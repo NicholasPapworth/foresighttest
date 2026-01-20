@@ -43,6 +43,7 @@ def init_db():
         location TEXT NOT NULL,
         delivery_window TEXT NOT NULL,
         price REAL NOT NULL,
+        sell_price REAL NOT NULL,
         unit TEXT NOT NULL,
         PRIMARY KEY (snapshot_id, supplier, product, location, delivery_window),
         FOREIGN KEY (snapshot_id) REFERENCES supplier_snapshots(snapshot_id)
@@ -54,6 +55,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_supplier_prices_lookup
     ON supplier_prices (snapshot_id, product, location, delivery_window);
     """)
+
+    _ensure_sell_price_column(cur, "supplier_prices")
 
     # --- Seed snapshots (NEW, identical shape to supplier snapshots) ---
     cur.execute("""
@@ -75,6 +78,7 @@ def init_db():
         location TEXT NOT NULL,
         delivery_window TEXT NOT NULL,
         price REAL NOT NULL,
+        sell_price REAL NOT NULL,
         unit TEXT NOT NULL,
         PRIMARY KEY (snapshot_id, supplier, product, location, delivery_window),
         FOREIGN KEY (snapshot_id) REFERENCES seed_snapshots(snapshot_id)
@@ -85,6 +89,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_seed_prices_lookup
     ON seed_prices (snapshot_id, product, location, delivery_window);
     """)
+
+    _ensure_sell_price_column(cur, "seed_prices") 
 
     # --- Admin margins ---
     cur.execute("""
@@ -278,7 +284,8 @@ def load_supplier_prices(snapshot_id: str) -> pd.DataFrame:
           product AS "Product",
           location AS "Location",
           delivery_window AS "Delivery Window",
-          price AS "Price",
+          price AS "Base Price",
+          COALESCE(sell_price, price) AS "Sell Price",
           unit AS "Unit"
         FROM supplier_prices
         WHERE snapshot_id = ?
@@ -292,7 +299,13 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     # --- DB safety net: drop rows with missing/invalid Price ---
     work = df.copy()
     work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
-    work = work.dropna(subset=["Price"])
+    
+    # If caller hasn't provided Sell Price yet, default Sell Price = Price
+    if "Sell Price" not in work.columns:
+        work["Sell Price"] = work["Price"]
+    work["Sell Price"] = pd.to_numeric(work["Sell Price"], errors="coerce")
+    
+    work = work.dropna(subset=["Price", "Sell Price"])
 
     if work.empty:
         raise ValueError("No valid rows to publish (all rows had blank/invalid Price).")
@@ -320,18 +333,26 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r.get("Location", "")).strip(),
             str(r["Delivery Window"]).strip(),
             float(r["Price"]),
+            float(r["Sell Price"]),
             str(r["Unit"]).strip(),
         ))
 
     cur.executemany("""
         INSERT INTO supplier_prices
-        (snapshot_id, supplier, product_category, product, location, delivery_window, price, unit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     c.commit()
     c.close()
     return snapshot_id
+
+def _ensure_sell_price_column(cur, table_name: str):
+    cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if "sell_price" not in cols:
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN sell_price REAL;")
+    # Backfill any NULLs so old snapshots still work
+    cur.execute(f"UPDATE {table_name} SET sell_price = price WHERE sell_price IS NULL;")
 
 # ---------------- Seed snapshots (NEW) ----------------
 
@@ -370,7 +391,8 @@ def load_seed_prices(snapshot_id: str) -> pd.DataFrame:
           product AS "Product",
           location AS "Location",
           delivery_window AS "Delivery Window",
-          price AS "Price",
+          price AS "Base Price",
+          COALESCE(sell_price, price) AS "Sell Price",
           unit AS "Unit"
         FROM seed_prices
         WHERE snapshot_id = ?
@@ -383,7 +405,12 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
     # --- DB safety net: drop rows with missing/invalid Price ---
     work = df.copy()
     work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
-    work = work.dropna(subset=["Price"])
+    
+    if "Sell Price" not in work.columns:
+        work["Sell Price"] = work["Price"]
+    work["Sell Price"] = pd.to_numeric(work["Sell Price"], errors="coerce")
+    
+    work = work.dropna(subset=["Price", "Sell Price"])
 
     if work.empty:
         raise ValueError("No valid rows to publish (all rows had blank/invalid Price).")
@@ -411,13 +438,14 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
             str(r.get("Location", "")).strip(),
             str(r["Delivery Window"]).strip(),
             float(r["Price"]),
+            float(r["Sell Price"]),
             str(r["Unit"]).strip(),
         ))
 
     cur.executemany("""
         INSERT INTO seed_prices
-        (snapshot_id, supplier, product_category, product, location, delivery_window, price, unit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     c.commit()
@@ -1071,6 +1099,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
