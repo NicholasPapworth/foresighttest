@@ -311,7 +311,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     """, (snapshot_id, published_at, published_by, source_hash, row_count))
 
     rows = []
-        for r in work.to_dict("records"):
+    for r in work.to_dict("records"):
         rows.append((
             snapshot_id,
             str(r["Supplier"]).strip(),
@@ -324,7 +324,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
         ))
 
     cur.executemany("""
-        INSERT OR IGNORE INTO supplier_prices
+        INSERT INTO supplier_prices
         (snapshot_id, supplier, product_category, product, location, delivery_window, price, unit)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
@@ -332,7 +332,6 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     c.commit()
     c.close()
     return snapshot_id
-
 
 # ---------------- Seed snapshots (NEW) ----------------
 
@@ -381,10 +380,18 @@ def load_seed_prices(snapshot_id: str) -> pd.DataFrame:
     return df
 
 def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: bytes) -> str:
+    # --- DB safety net: drop rows with missing/invalid Price ---
+    work = df.copy()
+    work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
+    work = work.dropna(subset=["Price"])
+
+    if work.empty:
+        raise ValueError("No valid rows to publish (all rows had blank/invalid Price).")
+
     snapshot_id = str(uuid.uuid4())
     published_at = utc_now_iso()
     source_hash = hashlib.sha256(source_bytes).hexdigest()
-    row_count = int(len(df))
+    row_count = int(len(work))
 
     c = conn()
     cur = c.cursor()
@@ -395,7 +402,7 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
     """, (snapshot_id, published_at, published_by, source_hash, row_count))
 
     rows = []
-        for r in work.to_dict("records"):
+    for r in work.to_dict("records"):
         rows.append((
             snapshot_id,
             str(r["Supplier"]).strip(),
@@ -1064,6 +1071,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
