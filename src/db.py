@@ -252,17 +252,24 @@ def set_setting(key: str, value: str):
 def _snapshot_hash_from_df(df: pd.DataFrame) -> str:
     cols = ["Supplier","Product Category","Product","Location","Delivery Window","Price","Sell Price","Unit"]
     tmp = df.copy()
+
+    # ensure all expected cols exist
     for c in cols:
         if c not in tmp.columns:
             tmp[c] = ""
+
     tmp = tmp[cols].copy()
 
-    # normalise
+    # normalise text keys
     for c in ["Supplier","Product Category","Product","Location","Delivery Window","Unit"]:
         tmp[c] = tmp[c].fillna("").astype(str).str.strip().str.lower()
 
+    # normalise numeric
     tmp["Price"] = pd.to_numeric(tmp["Price"], errors="coerce").fillna(0.0)
     tmp["Sell Price"] = pd.to_numeric(tmp["Sell Price"], errors="coerce").fillna(0.0)
+
+    # IMPORTANT: sort for deterministic hashing
+    tmp = tmp.sort_values(cols).reset_index(drop=True)
 
     payload = tmp.to_csv(index=False).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -447,10 +454,15 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
     c = conn()
     cur = c.cursor()
 
-    cur.execute("""
-        INSERT INTO seed_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
-        VALUES (?, ?, ?, ?, ?)
-    """, (snapshot_id, published_at, published_by, source_hash, row_count))
+    # Insert snapshot header
+    try:
+        cur.execute("""
+            INSERT INTO seed_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (snapshot_id, published_at, published_by, source_hash, row_count))
+    except sqlite3.IntegrityError as e:
+        c.close()
+        raise ValueError("This seed file has already been published (duplicate source_hash).") from e
 
     rows = []
     for r in work.to_dict("records"):
@@ -1128,6 +1140,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
