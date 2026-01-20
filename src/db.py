@@ -35,8 +35,8 @@ def init_db():
     """)
 
     cur.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_seed_snapshots_source_hash
-    ON seed_snapshots (source_hash);
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_supplier_snapshots_source_hash
+    ON supplier_snapshots (source_hash);
     """)
 
     cur.execute("""
@@ -299,17 +299,14 @@ def load_supplier_prices(snapshot_id: str) -> pd.DataFrame:
 
 
 def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes: bytes) -> str:
-    # --- DB safety net: drop rows with missing/invalid Price ---
     work = df.copy()
     work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
-    
-    # If caller hasn't provided Sell Price yet, default Sell Price = Price
+
     if "Sell Price" not in work.columns:
         work["Sell Price"] = work["Price"]
     work["Sell Price"] = pd.to_numeric(work["Sell Price"], errors="coerce")
-    
-    work = work.dropna(subset=["Price", "Sell Price"])
 
+    work = work.dropna(subset=["Price", "Sell Price"])
     if work.empty:
         raise ValueError("No valid rows to publish (all rows had blank/invalid Price).")
 
@@ -321,6 +318,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     c = conn()
     cur = c.cursor()
 
+    # Insert snapshot header
     try:
         cur.execute("""
             INSERT INTO supplier_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
@@ -330,6 +328,7 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
         c.close()
         raise ValueError("This supplier file has already been published (duplicate source_hash).") from e
 
+    # Insert snapshot rows
     rows = []
     for r in work.to_dict("records"):
         rows.append((
@@ -344,14 +343,11 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r["Unit"]).strip(),
         ))
 
-    try:
-        cur.execute("""
-            INSERT INTO seed_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
-            VALUES (?, ?, ?, ?, ?)
-        """, (snapshot_id, published_at, published_by, source_hash, row_count))
-    except sqlite3.IntegrityError as e:
-        c.close()
-        raise ValueError("This seed file has already been published (duplicate source_hash).") from e
+    cur.executemany("""
+        INSERT INTO supplier_prices
+        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
 
     c.commit()
     c.close()
@@ -1058,6 +1054,8 @@ def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
         GROUP BY user
         ORDER BY user ASC
     """, c, params=(cutoff,))
+    c.close()
+    return df
 
 def admin_margin_report() -> pd.DataFrame:
     """
@@ -1112,6 +1110,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
