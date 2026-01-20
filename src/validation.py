@@ -1,7 +1,7 @@
 import io
 import pandas as pd
 
-REQUIRED = ["Supplier", "Product", "Delivery Window", "Price", "Unit"]
+REQUIRED = ["Supplier", "Product", "Location", "Delivery Window", "Price", "Unit"]
 UNIQUE_KEY = ["Supplier", "Product", "Location", "Delivery Window"]
 
 SUPPLIER_SHEET = "SUPPLIER_PRICES"
@@ -21,8 +21,6 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {missing}")
 
     # Optional columns
-    if "Location" not in df.columns:
-        df["Location"] = ""
     if "Product Category" not in df.columns:
         df["Product Category"] = ""
 
@@ -35,14 +33,25 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
     # Convert Price to numeric; blanks/non-numeric become NaN (we will drop them)
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     
+    # Optional Sell Price: if provided, coerce to numeric; if missing, default to Price
+    if "Sell Price" in df.columns:
+        df["Sell Price"] = pd.to_numeric(df["Sell Price"], errors="coerce")
+    else:
+        df["Sell Price"] = df["Price"]
+    
     # Drop rows where Price is missing / blank / non-numeric
     df = df.dropna(subset=["Price"])
+    
+    # If Sell Price is NaN for any row, default it to Price (and then drop if still invalid)
+    df["Sell Price"] = df["Sell Price"].fillna(df["Price"])
+    df = df.dropna(subset=["Sell Price"])
 
 
     # Drop blank required fields
     df = df[
         (df["Supplier"] != "") &
         (df["Product"] != "") &
+        (df["Location"] != "") &
         (df["Delivery Window"] != "") &
         (df["Unit"] != "")
     ]
@@ -56,7 +65,7 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
             f"{bad.head(50)}"
         )
 
-    return df[["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Unit"]]
+    return df[["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Sell Price", "Unit"]]
 
 
 def load_supplier_sheet(content: bytes) -> pd.DataFrame:
