@@ -675,21 +675,13 @@ def _page_admin_pricing_impl(book_code: str):
     preview_bytes_key = _ss_key(book_code, "admin_preview_bytes")
     preview_name_key = _ss_key(book_code, "admin_preview_filename")
     
-    upload_key = _ss_key(book_code, "upload_excel")
-    # --- uploader key token so we can reset safely ---
-    tok_key = _ss_key(book_code, "upload_token")
-    if tok_key not in st.session_state:
-        st.session_state[tok_key] = 0
-    
-    upload_key = _ss_key(book_code, f"upload_excel_{st.session_state[tok_key]}")
-    # --- uploader key token so we can reset safely ---
+    # Namespaced uploader reset token
     tok_key = _ss_key(book_code, "upload_token")
     if tok_key not in st.session_state:
         st.session_state[tok_key] = 0
     
     upload_key = _ss_key(book_code, f"upload_excel_{st.session_state[tok_key]}")
     up = st.file_uploader("Upload Excel", type=["xlsx"], key=upload_key)
-    
         
     # If a new file is uploaded, validate and store preview in session_state (do NOT publish yet)
     if up is not None:
@@ -719,11 +711,11 @@ def _page_admin_pricing_impl(book_code: str):
             if st.button("Apply current margins to Sell Price", use_container_width=True, key=_ss_key(book_code, "btn_apply_margins_preview")):
                 try:
                     margins = get_effective_margins()
-    
-                    # apply_margins expects the loaded snapshot shape; adapt upload DF to that shape
-                    tmp = dfp.rename(columns={"Price": "Base Price"}).copy()
+            
+                    tmp = dfp.copy()
+                    # apply_margins expects 'Price' and returns/sets 'Sell Price'
                     tmp = apply_margins(tmp, margins)
-    
+            
                     dfp["Sell Price"] = pd.to_numeric(tmp["Sell Price"], errors="coerce")
                     st.session_state[preview_df_key] = dfp
                     st.success("Applied margins to Sell Price (preview).")
