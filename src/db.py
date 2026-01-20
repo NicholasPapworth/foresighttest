@@ -35,6 +35,11 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_seed_snapshots_source_hash
+    ON seed_snapshots (source_hash);
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS supplier_prices (
         snapshot_id TEXT NOT NULL,
         supplier TEXT NOT NULL,
@@ -67,6 +72,11 @@ def init_db():
         source_hash TEXT NOT NULL,
         row_count INTEGER NOT NULL
     );
+    """)
+
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_seed_snapshots_source_hash
+    ON seed_snapshots (source_hash);
     """)
 
     cur.execute("""
@@ -210,13 +220,6 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at_utc);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_order ON order_actions(order_id, action_at_utc);")
 
-    # --- Orders optimistic locking (version) ---
-    # Adds version column safely if DB already exists.
-    try:
-        cur.execute("ALTER TABLE orders ADD COLUMN version INTEGER NOT NULL DEFAULT 0;")
-    except Exception:
-        pass
-
     c.commit()
     c.close()
 
@@ -318,10 +321,14 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     c = conn()
     cur = c.cursor()
 
-    cur.execute("""
-        INSERT INTO supplier_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
-        VALUES (?, ?, ?, ?, ?)
-    """, (snapshot_id, published_at, published_by, source_hash, row_count))
+    try:
+        cur.execute("""
+            INSERT INTO supplier_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (snapshot_id, published_at, published_by, source_hash, row_count))
+    except sqlite3.IntegrityError as e:
+        c.close()
+        raise ValueError("This supplier file has already been published (duplicate source_hash).") from e
 
     rows = []
     for r in work.to_dict("records"):
@@ -337,11 +344,14 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r["Unit"]).strip(),
         ))
 
-    cur.executemany("""
-        INSERT INTO supplier_prices
-        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
+    try:
+        cur.execute("""
+            INSERT INTO seed_snapshots (snapshot_id, published_at_utc, published_by, source_hash, row_count)
+            VALUES (?, ?, ?, ?, ?)
+        """, (snapshot_id, published_at, published_by, source_hash, row_count))
+    except sqlite3.IntegrityError as e:
+        c.close()
+        raise ValueError("This seed file has already been published (duplicate source_hash).") from e
 
     c.commit()
     c.close()
@@ -1037,14 +1047,17 @@ def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
     c.commit()
 
     df = pd.read_sql_query("""
-        SELECT user, role, page, MIN(online_since_utc) AS online_since_utc, MAX(last_seen_utc) AS last_seen_utc
+        SELECT
+            user,
+            MAX(role) AS role,
+            MAX(page) AS page,
+            MIN(online_since_utc) AS online_since_utc,
+            MAX(last_seen_utc) AS last_seen_utc
         FROM user_presence
         WHERE last_seen_utc >= ?
-        GROUP BY user, role, page
+        GROUP BY user
         ORDER BY user ASC
     """, c, params=(cutoff,))
-    c.close()
-    return df
 
 def admin_margin_report() -> pd.DataFrame:
     """
@@ -1099,6 +1112,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
