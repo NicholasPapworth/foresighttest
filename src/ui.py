@@ -16,9 +16,10 @@ from src.db import (
     latest_supplier_snapshot, list_supplier_snapshots,
     load_supplier_prices, publish_supplier_snapshot,
 
-    # Seed snapshot functions (you will add in db.py later)
+    # Seed snapshot functions
     latest_seed_snapshot, list_seed_snapshots,
-    load_seed_prices, publish_seed_snapshot,
+    load_seed_prices, publish_seed_snapshot, list_seed_treatments, save_seed_treatments,
+
 
     add_margin, list_margins, deactivate_margin, get_effective_margins,
     create_order_from_allocation, list_orders_for_user, list_orders_admin,
@@ -307,7 +308,11 @@ def _page_trader_pricing_impl(book_code: str):
 
     st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
 
-    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    if book_code == "seed":
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
+    else:
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+
     with c1:
         product = st.selectbox(
             "Product",
@@ -335,12 +340,29 @@ def _page_trader_pricing_impl(book_code: str):
             key=_ss_key(book_code, "pricing_qty")
         )
 
+    addons_selected = []
+    if book_code == "seed":
+        with c5:
+            addons_selected = st.multiselect(
+                "Treatments (0–6)",
+                options=addons_options,
+                default=[],
+                key=_ss_key(book_code, "pricing_addons"),
+            )
+            if len(addons_selected) > 6:
+                st.error("Max 6 treatments per line.")
+
     if st.button("Add to basket", use_container_width=True, key=_ss_key(book_code, "btn_add_to_basket")):
+        if book_code == "seed" and len(addons_selected) > 6:
+            st.error("Max 6 treatments per line.")
+            return
+
         st.session_state[basket_key].append({
             "Product": product,
             "Location": location,
             "Delivery Window": window,
             "Qty": float(qty),
+            "Addons": addons_selected if book_code == "seed" else [],
         })
         st.rerun()
 
@@ -368,11 +390,20 @@ def _page_trader_pricing_impl(book_code: str):
                 columns={"Sell Price": "Price"}
             )
 
-            res = optimise_basket(
-                supplier_prices=sell_prices,
-                basket=st.session_state[basket_key],
-                tiers=tiers
-            )
+            if book_code == "fert":
+                res = optimise_basket(
+                    supplier_prices=sell_prices,
+                    basket=st.session_state[basket_key],
+                    tiers=tiers,
+                    addons_catalog=None
+                )
+            else:
+                res = optimise_basket(
+                    supplier_prices=sell_prices,
+                    basket=st.session_state[basket_key],
+                    tiers=None,
+                    addons_catalog=addons_catalog
+                )
 
             if not res.get("ok"):
                 st.error(res.get("error", "Unknown error"))
@@ -405,12 +436,18 @@ def _page_trader_pricing_impl(book_code: str):
     tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
     
     base_per_t = float(res["base_cost"]) / tonnes
-    lot_per_t  = float(res["lot_charge_total"]) / tonnes
+    lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
+    addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
     total_per_t = float(res["total"]) / tonnes
-    
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
-    c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
+
+    if book_code == "fert":
+        c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
+    else:
+        c2.metric("Treatments £/t", f"£{addons_per_t:,.2f}")
+
     c3.metric("All-in £/t", f"£{total_per_t:,.2f}")
 
     st.divider()
@@ -590,41 +627,71 @@ def _page_admin_pricing_impl(book_code: str):
 
     st.divider()
 
-    st.markdown("### Small-lot tiers")
-    tiers = get_small_lot_tiers()
-    if tiers is None or tiers.empty:
-        tiers = pd.DataFrame(columns=["min_t", "max_t", "charge_per_t", "active"])
+    if book_code == "fert":
+        st.markdown("### Small-lot tiers (Fertiliser only)")
+        tiers = get_small_lot_tiers()
+        if tiers is None or tiers.empty:
+            tiers = pd.DataFrame(columns=["min_t", "max_t", "charge_per_t", "active"])
+        else:
+            tiers = tiers[["min_t", "max_t", "charge_per_t", "active"]].copy()
+
+        edited = st.data_editor(
+            tiers,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key=_ss_key(book_code, "tiers_editor"),
+            column_config={
+                "min_t": st.column_config.NumberColumn("Min t", min_value=0.0, step=0.1),
+                "max_t": st.column_config.NumberColumn("Max t", min_value=0.0, step=0.1),
+                "charge_per_t": st.column_config.NumberColumn("Charge (£/t)", min_value=0.0, step=0.1),
+                "active": st.column_config.CheckboxColumn("Active"),
+            }
+        )
+
+        if st.button("Save tiers", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_tiers")):
+            try:
+                edited2 = edited.copy()
+                if "active" not in edited2.columns:
+                    edited2["active"] = 1
+                edited2["active"] = edited2["active"].apply(lambda x: 1 if bool(x) else 0)
+                if "max_t" not in edited2.columns:
+                    edited2["max_t"] = None
+
+                save_small_lot_tiers(edited2[["min_t", "max_t", "charge_per_t", "active"]])
+                st.success("Tiers saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
     else:
-        tiers = tiers[["min_t", "max_t", "charge_per_t", "active"]].copy()
+        st.markdown("### Seed treatments (add-ons, 0–6 per line)")
+        tdf = list_seed_treatments(active_only=False)
+        if tdf is None or tdf.empty:
+            tdf = pd.DataFrame(columns=["name", "charge_per_t", "active"])
+        else:
+            tdf = tdf[["name", "charge_per_t", "active"]].copy()
 
-    edited = st.data_editor(
-        tiers,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key=_ss_key(book_code, "tiers_editor"),
-        column_config={
-            "min_t": st.column_config.NumberColumn("Min t", min_value=0.0, step=0.1),
-            "max_t": st.column_config.NumberColumn("Max t", min_value=0.0, step=0.1),
-            "charge_per_t": st.column_config.NumberColumn("Charge (£/t)", min_value=0.0, step=0.1),
-            "active": st.column_config.CheckboxColumn("Active"),
-        }
-    )
+        edited = st.data_editor(
+            tdf,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key=_ss_key(book_code, "seed_treatments_editor"),
+            column_config={
+                "name": st.column_config.TextColumn("Treatment name"),
+                "charge_per_t": st.column_config.NumberColumn("Charge (£/t)", min_value=0.0, step=0.5),
+                "active": st.column_config.CheckboxColumn("Active"),
+            }
+        )
 
-    if st.button("Save tiers", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_tiers")):
-        try:
-            edited2 = edited.copy()
-            if "active" not in edited2.columns:
-                edited2["active"] = 1
-            edited2["active"] = edited2["active"].apply(lambda x: 1 if bool(x) else 0)
-            if "max_t" not in edited2.columns:
-                edited2["max_t"] = None
-
-            save_small_lot_tiers(edited2[["min_t", "max_t", "charge_per_t", "active"]])
-            st.success("Tiers saved.")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
+        if st.button("Save seed treatments", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_seed_treatments")):
+            try:
+                save_seed_treatments(edited, st.session_state.get("user", "unknown"))
+                st.success("Seed treatments saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
     st.divider()
 
