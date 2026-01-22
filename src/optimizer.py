@@ -43,7 +43,8 @@ def tier_charge_per_t(tonnes: float, tiers: pd.DataFrame) -> float:
 def optimise_basket(
     supplier_prices: pd.DataFrame,
     basket: list[dict],
-    tiers: pd.DataFrame
+    tiers: pd.DataFrame | None = None,
+    addons_catalog: dict[str, float] | None = None,
 ) -> dict:
     """
     Optimise a basket subject to:
@@ -64,6 +65,7 @@ def optimise_basket(
         - Location
         - Delivery Window
         - Qty
+        - Addons (optional, list[str])  # Seed treatments, 0–6 names
 
       tiers columns:
         - min_t
@@ -77,6 +79,7 @@ def optimise_basket(
         error: str (if ok=False)
         allocation: list[dict]
         lot_charges: list[dict]
+        addons_total: float
         base_cost: float
         lot_charge_total: float
         total: float
@@ -88,6 +91,23 @@ def optimise_basket(
     missing_sp = required_sp - set(supplier_prices.columns)
     if missing_sp:
         return {"ok": False, "error": f"supplier_prices missing columns: {sorted(missing_sp)}"}
+
+    # Optional Seed add-ons (treatments): name -> £/t
+    addons_catalog = addons_catalog or {}
+
+    def _addons_per_t(addon_list) -> float:
+        if not addon_list:
+            return 0.0
+        if not isinstance(addon_list, list):
+            raise ValueError("Addons must be a list of treatment names.")
+        if len(addon_list) > 6:
+            raise ValueError("Max 6 add-ons per line.")
+        total = 0.0
+        for a in addon_list:
+            if a not in addons_catalog:
+                raise ValueError(f"Unknown add-on: {a}")
+            total += float(addons_catalog[a])
+        return float(total)
 
     # Build per-line candidate suppliers
     candidates_by_line: list[tuple[dict, pd.DataFrame]] = []
@@ -141,6 +161,10 @@ def optimise_basket(
                 price = float(chosen["Price"])
                 qty = float(line["Qty"])
 
+                addon_list = line.get("Addons", []) or []
+                addons_per_t = _addons_per_t(addon_list)
+                addons_value = qty * addons_per_t
+
                 allocation.append({
                     "Product": line["Product"],
                     "Location": line["Location"],
@@ -148,7 +172,10 @@ def optimise_basket(
                     "Qty": qty,
                     "Supplier": s,
                     "Price": price,
-                    "Line Cost": qty * price
+                    "Addons": addon_list,
+                    "Addons £/t": addons_per_t,
+                    "Addons Value": addons_value,
+                    "Line Cost": (qty * price) + addons_value
                 })
 
                 tonnes_by_supplier[s] += qty
@@ -157,32 +184,35 @@ def optimise_basket(
             if not feasible:
                 continue
 
-            # Tiered small-lot charges per supplier (based on tonnes allocated to that supplier)
+            # Tiered small-lot charges per supplier (fertiliser only; tiers may be None)
             lot_charge_total = 0.0
             lot_charges = []
 
-            for s, t in tonnes_by_supplier.items():
-                if t <= 0:
-                    continue
+            if tiers is not None and not tiers.empty:
+                for s, t in tonnes_by_supplier.items():
+                    if t <= 0:
+                        continue
 
-                cpt = tier_charge_per_t(t, tiers)
-                if cpt > 0:
-                    c = t * cpt
-                    lot_charge_total += c
-                    lot_charges.append({
-                        "Supplier": s,
-                        "Tonnes": t,
-                        "Charge £/t": cpt,
-                        "Lot Charge": c
-                    })
+                    cpt = tier_charge_per_t(t, tiers)
+                    if cpt > 0:
+                        c = t * cpt
+                        lot_charge_total += c
+                        lot_charges.append({
+                            "Supplier": s,
+                            "Tonnes": t,
+                            "Charge £/t": cpt,
+                            "Lot Charge": c
+                        })
 
-            total = base_cost + lot_charge_total
+            addons_total = sum(float(r.get("Addons Value", 0.0)) for r in allocation)
+            total = base_cost + lot_charge_total + addons_total
 
             if best is None or total < best["total"]:
                 best = {
                     "total": total,
                     "base_cost": base_cost,
                     "lot_charge_total": lot_charge_total,
+                    "addons_total": addons_total,
                     "allocation": allocation,
                     "lot_charges": lot_charges
                 }
