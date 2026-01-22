@@ -290,6 +290,23 @@ def _page_trader_pricing_impl(book_code: str):
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
 
+    # ---- Seed add-ons (treatments) ----
+    # Only required for Seed book. Provides:
+    # - addons_options: list of treatment names for the multiselect
+    # - addons_catalog: dict name -> charge_per_t for optimise_basket()
+    addons_options = []
+    addons_catalog = {}
+
+    if book_code == "seed":
+        tdf = list_seed_treatments(active_only=True)
+        if tdf is not None and not tdf.empty:
+            addons_options = tdf["name"].astype(str).tolist()
+            addons_catalog = {
+                str(r["name"]): float(r["charge_per_t"])
+                for _, r in tdf.iterrows()
+                if pd.notna(r["name"]) and pd.notna(r["charge_per_t"])
+            }
+
     # Namespaced session keys
     basket_key = _ss_key(book_code, "basket")
     basket_created_key = _ss_key(book_code, "basket_created_at")
@@ -456,7 +473,7 @@ def _page_trader_pricing_impl(book_code: str):
     if book_code == "seed":
         st.info(
             "Seed ordering is not enabled yet. You can view and optimise seed pricing, "
-            "but submitting seed orders is disabled until the database is updated."
+            "but submitting seed orders is currently disabled."
         )
         return
 
@@ -996,7 +1013,7 @@ def page_admin_orders():
         with c1:
             if st.button("Confirm as-is", type="primary", use_container_width=True):
                 try:
-                    admin_confirm_order(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
+                    admin_confirm_order(order_id, admin_user=st.session_state.get("user", "unknown"), expected_version=header["version"])
                     st.success("Order CONFIRMED.")
                     st.rerun()
                 except Exception as e:
@@ -1015,7 +1032,7 @@ def page_admin_orders():
             
                     admin_counter_order(
                         order_id,
-                        user = st.session_state.get("user", "unknown"),
+                        admin_user=st.session_state.get("user", "unknown"),
                         edited_lines=edited,
                         admin_note=admin_note,
                         expected_version=header["version"]
@@ -1028,7 +1045,7 @@ def page_admin_orders():
         with c3:
             if st.button("Reject", use_container_width=True):
                 try:
-                    admin_reject_order(order_id, user = st.session_state.get("user", "unknown"), admin_note=admin_note, expected_version=header["version"])
+                    admin_reject_order(order_id, admin_user=st.session_state.get("user", "unknown"), admin_note=admin_note, expected_version=header["version"])
                     st.success("Order REJECTED.")
                     st.rerun()
                 except Exception as e:
@@ -1038,7 +1055,7 @@ def page_admin_orders():
         st.markdown("### Fill")
         if st.button("Mark FILLED", type="primary", use_container_width=True):
             try:
-                admin_mark_filled(order_id, user = st.session_state.get("user", "unknown"), expected_version=header["version"])
+                admin_mark_filled(order_id, admin_user=st.session_state.get("user", "unknown"), expected_version=header["version"])
                 st.success("Order marked FILLED.")
                 st.rerun()
             except Exception as e:
