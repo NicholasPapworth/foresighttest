@@ -154,6 +154,18 @@ def init_db():
     );
     """)
 
+    # --- Seed treatments (Seed-only add-ons) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seed_treatments (
+        treatment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        charge_per_t REAL NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at_utc TEXT NOT NULL,
+        created_by TEXT NOT NULL
+    );
+    """)
+
     # Seed defaults if empty
     cur.execute("SELECT COUNT(*) FROM small_lot_tiers;")
     if cur.fetchone()[0] == 0:
@@ -219,6 +231,88 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_by_user ON orders(created_by, created_at_utc);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at_utc);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_order ON order_actions(order_id, action_at_utc);")
+
+    c.commit()
+    c.close()
+
+# ---------------- Seed treatments ----------------
+
+def list_seed_treatments(active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT treatment_id, name, charge_per_t, active, created_at_utc, created_by
+            FROM seed_treatments
+            WHERE active = 1
+            ORDER BY name ASC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT treatment_id, name, charge_per_t, active, created_at_utc, created_by
+            FROM seed_treatments
+            ORDER BY name ASC
+        """, c)
+    c.close()
+    return df
+
+
+def save_seed_treatments(df: pd.DataFrame, user: str):
+    """
+    Admin editor save:
+      expects cols: name, charge_per_t, active
+      we implement as "replace active set":
+        - mark all existing as inactive
+        - upsert incoming names with new values
+    """
+    work = df.copy()
+
+    for col in ["name", "charge_per_t"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in treatments editor.")
+
+    work["name"] = work["name"].fillna("").astype(str).str.strip()
+    work = work[work["name"] != ""]  # drop blank names
+
+    work["charge_per_t"] = pd.to_numeric(work["charge_per_t"], errors="raise")
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+
+    # Validate no duplicates (case-insensitive)
+    lowered = work["name"].str.lower()
+    if lowered.duplicated().any():
+        dups = work.loc[lowered.duplicated(), "name"].tolist()
+        raise ValueError(f"Duplicate treatment names detected: {dups}")
+
+    c = conn()
+    cur = c.cursor()
+
+    # Inactivate everything first (soft reset)
+    cur.execute("UPDATE seed_treatments SET active = 0;")
+
+    now = utc_now_iso()
+
+    # Upsert by name
+    for _, r in work.iterrows():
+        nm = r["name"]
+        ch = float(r["charge_per_t"])
+        ac = int(r["active"])
+
+        # If exists: update, else insert
+        cur.execute("SELECT treatment_id FROM seed_treatments WHERE name = ?", (nm,))
+        ex = cur.fetchone()
+        if ex:
+            cur.execute("""
+                UPDATE seed_treatments
+                SET charge_per_t = ?, active = ?
+                WHERE name = ?
+            """, (ch, ac, nm))
+        else:
+            cur.execute("""
+                INSERT INTO seed_treatments (name, charge_per_t, active, created_at_utc, created_by)
+                VALUES (?, ?, ?, ?, ?)
+            """, (nm, ch, ac, now, user))
 
     c.commit()
     c.close()
@@ -1141,6 +1235,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
