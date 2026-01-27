@@ -20,6 +20,7 @@ from src.db import (
     latest_seed_snapshot, list_seed_snapshots,
     load_seed_prices, publish_seed_snapshot, list_seed_treatments, save_seed_treatments,
 
+    list_fert_delivery_options, save_fert_delivery_options,
 
     add_margin, list_margins, deactivate_margin, get_effective_margins,
     create_order_from_allocation, list_orders_for_user, list_orders_admin,
@@ -290,6 +291,24 @@ def _page_trader_pricing_impl(book_code: str):
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
 
+    # ---- Fertiliser delivery options ----
+    delivery_options = ["Delivered"]
+    delivery_delta_map = {"Delivered": 0.0}
+
+    if book_code == "fert":
+        ddf = list_fert_delivery_options(active_only=True)
+        if ddf is not None and not ddf.empty:
+            delivery_options = ddf["name"].astype(str).tolist()
+            delivery_delta_map = {
+                str(r["name"]): float(r["delta_per_t"])
+                for _, r in ddf.iterrows()
+                if pd.notna(r["name"]) and pd.notna(r["delta_per_t"])
+            }
+        # Ensure default exists
+        if "Delivered" not in delivery_delta_map:
+            delivery_options = ["Delivered"] + [x for x in delivery_options if x != "Delivered"]
+            delivery_delta_map["Delivered"] = 0.0
+
     # ---- Seed add-ons (treatments) ----
     # Only required for Seed book. Provides:
     # - addons_options: list of treatment names for the multiselect
@@ -328,7 +347,7 @@ def _page_trader_pricing_impl(book_code: str):
     if book_code == "seed":
         c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
     else:
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+       c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
 
     with c1:
         product = st.selectbox(
@@ -355,7 +374,16 @@ def _page_trader_pricing_impl(book_code: str):
             value=10.0,
             step=1.0,
             key=_ss_key(book_code, "pricing_qty")
-        )
+
+            delivery_method = "Delivered"
+            if book_code == "fert":
+                with c5:
+                    delivery_method = st.selectbox(
+                        "Delivery method",
+                        options=delivery_options,
+                        index=delivery_options.index("Delivered") if "Delivered" in delivery_options else 0,
+                        key=_ss_key(book_code, "pricing_delivery_method"),
+                    )
 
     addons_selected = []
     if book_code == "seed":
@@ -374,13 +402,17 @@ def _page_trader_pricing_impl(book_code: str):
             st.error("Max 6 treatments per line.")
             return
 
-        st.session_state[basket_key].append({
+        item = {
             "Product": product,
             "Location": location,
             "Delivery Window": window,
             "Qty": float(qty),
             "Addons": addons_selected if book_code == "seed" else [],
-        })
+        }
+        if book_code == "fert":
+            item["Delivery Method"] = delivery_method
+
+        st.session_state[basket_key].append(item)
         st.rerun()
 
     st.divider()
@@ -452,16 +484,31 @@ def _page_trader_pricing_impl(book_code: str):
     tonnes = float(pd.to_numeric(alloc_df["Qty"], errors="coerce").fillna(0.0).sum()) if not alloc_df.empty else 0.0
     tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
     
-    base_per_t = float(res["base_cost"]) / tonnes
-    lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
-    addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
-    total_per_t = float(res["total"]) / tonnes
+        base_per_t = float(res["base_cost"]) / tonnes
+        lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
+        addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
+    
+        # Fertiliser delivery adjustment (negative = discount)
+        delivery_total = 0.0
+        delivery_per_t = 0.0
+        if book_code == "fert":
+            bdf2 = pd.DataFrame(st.session_state[basket_key])
+            if "Delivery Method" in bdf2.columns and not bdf2.empty:
+                for _, rr in bdf2.iterrows():
+                    dm = str(rr.get("Delivery Method", "Delivered"))
+                    q = float(rr.get("Qty", 0.0) or 0.0)
+                    delivery_total += float(delivery_delta_map.get(dm, 0.0)) * q
+            delivery_per_t = delivery_total / tonnes
+    
+        total_per_t = (float(res["total"]) + delivery_total) / tonnes
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
 
     if book_code == "fert":
         c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
+        st.caption(f"Delivery adjustment: £{delivery_per_t:,.2f}/t (applied after optimisation)")
+
     else:
         c2.metric("Treatments £/t", f"£{addons_per_t:,.2f}")
 
@@ -665,6 +712,36 @@ def _page_admin_pricing_impl(book_code: str):
                 "active": st.column_config.CheckboxColumn("Active"),
             }
         )
+
+        st.divider()
+        st.markdown("### Fertiliser delivery / collection options")
+
+        ddf = list_fert_delivery_options(active_only=False)
+        if ddf is None or ddf.empty:
+            ddf = pd.DataFrame(columns=["name", "delta_per_t", "active"])
+        else:
+            ddf = ddf[["name", "delta_per_t", "active"]].copy()
+
+        edited_opts = st.data_editor(
+            ddf,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key=_ss_key(book_code, "fert_delivery_options_editor"),
+            column_config={
+                "name": st.column_config.TextColumn("Option name"),
+                "delta_per_t": st.column_config.NumberColumn("Price delta (£/t)", step=0.5),
+                "active": st.column_config.CheckboxColumn("Active"),
+            }
+        )
+
+        if st.button("Save delivery options", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_fert_delivery_options")):
+            try:
+                save_fert_delivery_options(edited_opts, st.session_state.get("user", "unknown"))
+                st.success("Delivery options saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
         if st.button("Save tiers", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_tiers")):
             try:
