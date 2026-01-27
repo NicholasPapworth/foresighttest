@@ -381,7 +381,12 @@ def _page_trader_pricing_impl(book_code: str):
         if not sel.empty:
             st.markdown("#### Notes / Cost of N (for selection)")
             st.dataframe(sel, use_container_width=True, hide_index=True)
-    
+            st.markdown("#### Notes / Cost of N (for selection)")
+            if sel.empty:
+                st.caption("No supplier rows found for this selection.")
+            else:
+                st.dataframe(sel, use_container_width=True, hide_index=True)
+
     with c4:
         qty = st.number_input(
             "Qty (t)",
@@ -451,8 +456,9 @@ def _page_trader_pricing_impl(book_code: str):
 
     with colB:
         if st.button("Optimise", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_optimise")):
-            sell_prices = df[["Supplier", "Product", "Location", "Delivery Window", "Sell Price"]].rename(
-                columns={"Sell Price": "Price"}
+            price_col = "Sell Price" if "Sell Price" in df.columns else "Price"
+            sell_prices = df[["Supplier", "Product", "Location", "Delivery Window", price_col]].rename(
+                columns={price_col: "Price"}
             )
 
             if book_code == "fert":
