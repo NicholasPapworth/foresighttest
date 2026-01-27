@@ -556,7 +556,27 @@ def _page_trader_pricing_impl(book_code: str):
                 return
             base_price = float(match.iloc[0][base_col])
 
-            sell_price = float(match.iloc[0]["Sell Price"])
+            sell_price_base = float(match.iloc[0]["Sell Price"])
+
+            # Apply delivery delta (fert only)
+            delivery_method_line = ""
+            delivery_delta = 0.0
+            if book_code == "fert":
+                # Find basket line matching Product/Location/Window to get its delivery method
+                bdf2 = pd.DataFrame(st.session_state[basket_key])
+                dm = "Delivered"
+                if not bdf2.empty and "Delivery Method" in bdf2.columns:
+                    hit = bdf2[
+                        (bdf2["Product"] == prod) &
+                        (bdf2["Location"] == loc) &
+                        (bdf2["Delivery Window"] == win)
+                    ]
+                    if not hit.empty:
+                        dm = str(hit.iloc[0].get("Delivery Method", "Delivered"))
+                delivery_method_line = dm
+                delivery_delta = float(delivery_delta_map.get(dm, 0.0))
+
+            sell_price = sell_price_base + delivery_delta
             unit = str(match.iloc[0]["Unit"])
             pcat = str(match.iloc[0].get("Product Category", ""))
 
@@ -570,8 +590,9 @@ def _page_trader_pricing_impl(book_code: str):
                 "Supplier": sup,
                 "Base Price": base_price,
                 "Sell Price": sell_price,
+                "Delivery Method": delivery_method_line,
+                "Delivery Delta Per T": delivery_delta,
             })
-
         try:
             user = st.session_state.get("user", "unknown")
             order_id = create_order_from_allocation(
