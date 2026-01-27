@@ -378,14 +378,11 @@ def _page_trader_pricing_impl(book_code: str):
             (df["Delivery Window"] == window)
         ][["Supplier"] + meta_cols].copy()
     
-        if not sel.empty:
-            st.markdown("#### Notes / Cost of N (for selection)")
+        st.markdown("#### Notes / Cost of N (for selection)")
+        if sel.empty:
+            st.caption("No supplier rows found for this selection.")
+        else:
             st.dataframe(sel, use_container_width=True, hide_index=True)
-            st.markdown("#### Notes / Cost of N (for selection)")
-            if sel.empty:
-                st.caption("No supplier rows found for this selection.")
-            else:
-                st.dataframe(sel, use_container_width=True, hide_index=True)
 
     with c4:
         qty = st.number_input(
@@ -578,7 +575,7 @@ def _page_trader_pricing_impl(book_code: str):
                 return
             base_price = float(match.iloc[0][base_col])
 
-            sell_price_base = float(match.iloc[0]["Sell Price"])
+            sell_price_base = float(match.iloc[0]["Sell Price"]) if "Sell Price" in match.columns else float(match.iloc[0]["Price"])
 
             # Apply delivery delta (fert only)
             delivery_method_line = ""
