@@ -27,8 +27,14 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
     def _clean_str(s: pd.Series) -> pd.Series:
         return s.fillna("").astype(str).str.strip()
 
-    for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category"]:
+    for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category", "Notes", "Cost/kg N"]:
         df[c] = _clean_str(df[c])
+
+    # Optional columns (NEW)
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    if "Cost/kg N" not in df.columns:
+        df["Cost/kg N"] = ""
 
     # Convert Price to numeric; blanks/non-numeric become NaN (we will drop them)
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
@@ -65,7 +71,11 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
             f"{bad.head(50)}"
         )
 
-    return df[["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Sell Price", "Unit"]]
+    return df[[
+        "Supplier", "Product Category", "Product", "Location", "Delivery Window",
+        "Price", "Sell Price", "Unit",
+        "Notes", "Cost/kg N"
+    ]]
 
 
 def load_supplier_sheet(content: bytes) -> pd.DataFrame:
