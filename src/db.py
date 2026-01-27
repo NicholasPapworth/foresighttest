@@ -260,6 +260,9 @@ def init_db():
     );
     """)
 
+    _ensure_column(cur, "order_lines", "delivery_method", "delivery_method TEXT")
+    _ensure_column(cur, "order_lines", "delivery_delta_per_t", "delivery_delta_per_t REAL")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS order_actions (
         action_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,6 +586,8 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r["Unit"]).strip(),
             str(r.get("Notes", "")).strip(),
             str(r.get("Cost/kg N", "")).strip(),
+            str(ln.get("Delivery Method", "")).strip(),
+            float(ln.get("Delivery Delta Per T", 0.0)),
         ))
 
     cur.executemany("""
@@ -1030,8 +1035,8 @@ def create_order_from_allocation(
 
     cur.executemany("""
         INSERT INTO order_lines
-        (order_id, line_no, product_category, product, location, delivery_window, qty, unit, supplier, base_price, sell_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (order_id, line_no, product_category, product, location, delivery_window, qty, unit, supplier, base_price, sell_price, delivery_method, delivery_delta_per_t)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     _add_action(cur, order_id, "SUBMIT", created_by, {"lines": len(rows)})
@@ -1081,10 +1086,18 @@ def list_orders_admin(status_filter: str | None = None) -> pd.DataFrame:
 def get_order_lines(order_id: str) -> pd.DataFrame:
     c = conn()
     df = pd.read_sql_query("""
-        SELECT line_no, product_category AS "Product Category", product AS "Product",
-               location AS "Location", delivery_window AS "Delivery Window",
-               qty AS "Qty", unit AS "Unit", supplier AS "Supplier",
-               base_price AS "Base Price", sell_price AS "Sell Price"
+        SELECT line_no,
+               product_category AS "Product Category",
+               product AS "Product",
+               location AS "Location",
+               delivery_window AS "Delivery Window",
+               qty AS "Qty",
+               unit AS "Unit",
+               supplier AS "Supplier",
+               base_price AS "Base Price",
+               sell_price AS "Sell Price",
+               COALESCE(delivery_method, '') AS "Delivery Method",
+               COALESCE(delivery_delta_per_t, 0.0) AS "Delivery Delta Per T"
         FROM order_lines
         WHERE order_id = ?
         ORDER BY line_no ASC
@@ -1360,6 +1373,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
