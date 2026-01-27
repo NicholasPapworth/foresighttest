@@ -18,6 +18,14 @@ def conn():
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def _ensure_column(cur, table_name: str, col_name: str, col_ddl: str):
+    """
+    Adds a column if missing.
+    col_ddl example: "notes TEXT"
+    """
+    cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if col_name not in cols:
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_ddl};")
 
 def init_db():
     c = conn()
@@ -50,6 +58,8 @@ def init_db():
         price REAL NOT NULL,
         sell_price REAL NOT NULL,
         unit TEXT NOT NULL,
+        notes TEXT,
+        cost_per_kg_n TEXT,
         PRIMARY KEY (snapshot_id, supplier, product, location, delivery_window),
         FOREIGN KEY (snapshot_id) REFERENCES supplier_snapshots(snapshot_id)
     );
@@ -62,6 +72,12 @@ def init_db():
     """)
 
     _ensure_sell_price_column(cur, "supplier_prices")
+
+    _ensure_column(cur, "supplier_prices", "notes", "notes TEXT")
+    _ensure_column(cur, "supplier_prices", "cost_per_kg_n", "cost_per_kg_n TEXT")
+
+    _ensure_column(cur, "seed_prices", "notes", "notes TEXT")
+    _ensure_column(cur, "seed_prices", "cost_per_kg_n", "cost_per_kg_n TEXT")
 
     # --- Seed snapshots (NEW, identical shape to supplier snapshots) ---
     cur.execute("""
@@ -90,6 +106,8 @@ def init_db():
         price REAL NOT NULL,
         sell_price REAL NOT NULL,
         unit TEXT NOT NULL,
+        notes TEXT,
+        cost_per_kg_n TEXT,
         PRIMARY KEY (snapshot_id, supplier, product, location, delivery_window),
         FOREIGN KEY (snapshot_id) REFERENCES seed_snapshots(snapshot_id)
     );
@@ -114,6 +132,32 @@ def init_db():
         created_by TEXT NOT NULL
     );
     """)
+
+    # --- Fertiliser delivery/collection options (Fert-only add-ons) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fert_delivery_options (
+        option_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        delta_per_t REAL NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at_utc TEXT NOT NULL,
+        created_by TEXT NOT NULL
+    );
+    """)
+
+    # Defaults if empty
+    cur.execute("SELECT COUNT(*) FROM fert_delivery_options;")
+    if cur.fetchone()[0] == 0:
+        now = utc_now_iso()
+        cur.executemany("""
+            INSERT INTO fert_delivery_options (name, delta_per_t, active, created_at_utc, created_by)
+            VALUES (?, ?, 1, ?, ?)
+        """, [
+            ("Delivered", 0.0, now, "system"),
+            ("Bulk delivered", -5.0, now, "system"),
+            ("Collected", -10.0, now, "system"),
+            ("Collected bulk", -15.0, now, "system"),
+        ])
 
     # --- Presence (who is online) ---
     cur.execute("""
@@ -235,6 +279,81 @@ def init_db():
     c.commit()
     c.close()
 
+def list_fert_delivery_options(active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT option_id, name, delta_per_t, active, created_at_utc, created_by
+            FROM fert_delivery_options
+            WHERE active = 1
+            ORDER BY name ASC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT option_id, name, delta_per_t, active, created_at_utc, created_by
+            FROM fert_delivery_options
+            ORDER BY name ASC
+        """, c)
+    c.close()
+    return df
+
+# ---------------- Fert delivery options ----------------
+
+def save_fert_delivery_options(df: pd.DataFrame, user: str):
+    """
+    Admin editor save:
+      expects cols: name, delta_per_t, active
+      - marks all inactive
+      - upserts incoming names
+    """
+    work = df.copy()
+
+    for col in ["name", "delta_per_t"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in delivery options editor.")
+
+    work["name"] = work["name"].fillna("").astype(str).str.strip()
+    work = work[work["name"] != ""]
+
+    work["delta_per_t"] = pd.to_numeric(work["delta_per_t"], errors="raise")
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+
+    lowered = work["name"].str.lower()
+    if lowered.duplicated().any():
+        dups = work.loc[lowered.duplicated(), "name"].tolist()
+        raise ValueError(f"Duplicate delivery option names detected: {dups}")
+
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("UPDATE fert_delivery_options SET active = 0;")
+    now = utc_now_iso()
+
+    for _, r in work.iterrows():
+        nm = r["name"]
+        dp = float(r["delta_per_t"])
+        ac = int(r["active"])
+
+        cur.execute("SELECT option_id FROM fert_delivery_options WHERE name = ?", (nm,))
+        ex = cur.fetchone()
+        if ex:
+            cur.execute("""
+                UPDATE fert_delivery_options
+                SET delta_per_t = ?, active = ?
+                WHERE name = ?
+            """, (dp, ac, nm))
+        else:
+            cur.execute("""
+                INSERT INTO fert_delivery_options (name, delta_per_t, active, created_at_utc, created_by)
+                VALUES (?, ?, ?, ?, ?)
+            """, (nm, dp, ac, now, user))
+
+    c.commit()
+    c.close()
+
 # ---------------- Seed treatments ----------------
 
 def list_seed_treatments(active_only: bool = False) -> pd.DataFrame:
@@ -344,25 +463,25 @@ def set_setting(key: str, value: str):
     c.close()
 
 def _snapshot_hash_from_df(df: pd.DataFrame) -> str:
-    cols = ["Supplier","Product Category","Product","Location","Delivery Window","Price","Sell Price","Unit"]
+    cols = [
+        "Supplier","Product Category","Product","Location","Delivery Window",
+        "Price","Sell Price","Unit",
+        "Notes","Cost/kg N"
+    ]
     tmp = df.copy()
 
-    # ensure all expected cols exist
     for c in cols:
         if c not in tmp.columns:
             tmp[c] = ""
 
     tmp = tmp[cols].copy()
 
-    # normalise text keys
-    for c in ["Supplier","Product Category","Product","Location","Delivery Window","Unit"]:
+    for c in ["Supplier","Product Category","Product","Location","Delivery Window","Unit","Notes","Cost/kg N"]:
         tmp[c] = tmp[c].fillna("").astype(str).str.strip().str.lower()
 
-    # normalise numeric
     tmp["Price"] = pd.to_numeric(tmp["Price"], errors="coerce").fillna(0.0)
     tmp["Sell Price"] = pd.to_numeric(tmp["Sell Price"], errors="coerce").fillna(0.0)
 
-    # IMPORTANT: sort for deterministic hashing
     tmp = tmp.sort_values(cols).reset_index(drop=True)
 
     payload = tmp.to_csv(index=False).encode("utf-8")
@@ -408,7 +527,9 @@ def load_supplier_prices(snapshot_id: str) -> pd.DataFrame:
           delivery_window AS "Delivery Window",
           price AS "Price",
           COALESCE(sell_price, price) AS "Sell Price",
-          unit AS "Unit"
+          unit AS "Unit",
+          COALESCE(notes, '') AS "Notes",
+          COALESCE(cost_per_kg_n, '') AS "Cost/kg N"
         FROM supplier_prices
         WHERE snapshot_id = ?
         ORDER BY supplier, product, location, delivery_window
@@ -460,12 +581,14 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             float(r["Price"]),
             float(r["Sell Price"]),
             str(r["Unit"]).strip(),
+            str(r.get("Notes", "")).strip(),
+            str(r.get("Cost/kg N", "")).strip(),
         ))
 
     cur.executemany("""
         INSERT INTO supplier_prices
-        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit, notes, cost_per_kg_n)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     c.commit()
@@ -518,7 +641,9 @@ def load_seed_prices(snapshot_id: str) -> pd.DataFrame:
           delivery_window AS "Delivery Window",
           price AS "Price",
           COALESCE(sell_price, price) AS "Sell Price",
-          unit AS "Unit"
+          unit AS "Unit",
+          COALESCE(notes, '') AS "Notes",
+          COALESCE(cost_per_kg_n, '') AS "Cost/kg N"
         FROM seed_prices
         WHERE snapshot_id = ?
         ORDER BY supplier, product, location, delivery_window
@@ -1235,6 +1360,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
