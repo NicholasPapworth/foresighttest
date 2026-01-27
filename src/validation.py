@@ -31,8 +31,14 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
     def _clean_str(s: pd.Series) -> pd.Series:
         return s.fillna("").astype(str).str.strip()
 
-    for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category", "Notes", "Cost/kg N"]:
+    for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category", "Notes"]:
         df[c] = _clean_str(df[c])
+    
+    # Cost/kg N should be numeric if present
+    if "Cost/kg N" in df.columns:
+        df["Cost/kg N"] = pd.to_numeric(df["Cost/kg N"], errors="coerce")
+    else:
+        df["Cost/kg N"] = pd.NA
 
     # Convert Price to numeric; blanks/non-numeric become NaN (we will drop them)
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
