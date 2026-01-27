@@ -20,21 +20,19 @@ def _load_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    # Optional columns
+     # Optional columns
     if "Product Category" not in df.columns:
         df["Product Category"] = ""
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    if "Cost/kg N" not in df.columns:
+        df["Cost/kg N"] = ""
 
     def _clean_str(s: pd.Series) -> pd.Series:
         return s.fillna("").astype(str).str.strip()
 
     for c in ["Supplier", "Product", "Location", "Delivery Window", "Unit", "Product Category", "Notes", "Cost/kg N"]:
         df[c] = _clean_str(df[c])
-
-    # Optional columns (NEW)
-    if "Notes" not in df.columns:
-        df["Notes"] = ""
-    if "Cost/kg N" not in df.columns:
-        df["Cost/kg N"] = ""
 
     # Convert Price to numeric; blanks/non-numeric become NaN (we will drop them)
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
