@@ -27,6 +27,13 @@ def _ensure_column(cur, table_name: str, col_name: str, col_ddl: str):
     if col_name not in cols:
         cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_ddl};")
 
+def _ensure_sell_price_column(cur, table_name: str):
+    cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if "sell_price" not in cols:
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN sell_price REAL;")
+    # Backfill any NULLs so old snapshots still work
+    cur.execute(f"UPDATE {table_name} SET sell_price = price WHERE sell_price IS NULL;")
+
 def init_db():
     c = conn()
     cur = c.cursor()
@@ -76,9 +83,6 @@ def init_db():
     _ensure_column(cur, "supplier_prices", "notes", "notes TEXT")
     _ensure_column(cur, "supplier_prices", "cost_per_kg_n", "cost_per_kg_n TEXT")
 
-    _ensure_column(cur, "seed_prices", "notes", "notes TEXT")
-    _ensure_column(cur, "seed_prices", "cost_per_kg_n", "cost_per_kg_n TEXT")
-
     # --- Seed snapshots (NEW, identical shape to supplier snapshots) ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS seed_snapshots (
@@ -112,6 +116,9 @@ def init_db():
         FOREIGN KEY (snapshot_id) REFERENCES seed_snapshots(snapshot_id)
     );
     """)
+
+    _ensure_column(cur, "seed_prices", "notes", "notes TEXT")
+    _ensure_column(cur, "seed_prices", "cost_per_kg_n", "cost_per_kg_n TEXT")
 
     cur.execute("""
     CREATE INDEX IF NOT EXISTS idx_seed_prices_lookup
@@ -586,10 +593,8 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
             str(r["Unit"]).strip(),
             str(r.get("Notes", "")).strip(),
             str(r.get("Cost/kg N", "")).strip(),
-            str(ln.get("Delivery Method", "")).strip(),
-            float(ln.get("Delivery Delta Per T", 0.0)),
         ))
-
+    
     cur.executemany("""
         INSERT INTO supplier_prices
         (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit, notes, cost_per_kg_n)
@@ -599,13 +604,6 @@ def publish_supplier_snapshot(df: pd.DataFrame, published_by: str, source_bytes:
     c.commit()
     c.close()
     return snapshot_id
-
-def _ensure_sell_price_column(cur, table_name: str):
-    cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()]
-    if "sell_price" not in cols:
-        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN sell_price REAL;")
-    # Backfill any NULLs so old snapshots still work
-    cur.execute(f"UPDATE {table_name} SET sell_price = price WHERE sell_price IS NULL;")
 
 # ---------------- Seed snapshots (NEW) ----------------
 
@@ -700,12 +698,14 @@ def publish_seed_snapshot(df: pd.DataFrame, published_by: str, source_bytes: byt
             float(r["Price"]),
             float(r["Sell Price"]),
             str(r["Unit"]).strip(),
+            str(r.get("Notes", "")).strip(),
+            str(r.get("Cost/kg N", "")).strip(),
         ))
-
+    
     cur.executemany("""
         INSERT INTO seed_prices
-        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (snapshot_id, supplier, product_category, product, location, delivery_window, price, sell_price, unit, notes, cost_per_kg_n)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     c.commit()
@@ -1031,6 +1031,8 @@ def create_order_from_allocation(
             str(ln["Supplier"]).strip(),
             float(ln["Base Price"]),
             float(ln["Sell Price"]),
+            str(ln.get("Delivery Method", "")).strip(),
+            float(ln.get("Delivery Delta Per T", 0.0) or 0.0),
         ))
 
     cur.executemany("""
@@ -1373,6 +1375,7 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
 
 
 
