@@ -37,11 +37,6 @@ from src.pricing import apply_margins
 
 LOGO_PATH = "assets/logo.svg"
 
-import time
-import base64
-from pathlib import Path
-import streamlit as st
-
 def show_boot_splash(video_path: str | None = None, seconds: float = 4.8):
     """
     Full-screen splash ONCE per session.
@@ -343,15 +338,6 @@ def _page_trader_pricing_impl(book_code: str):
         st.info("Basket expired and has been cleared.")
 
     st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
-
-    # Show notes / cost of N for the selected product/location/window
-    meta_cols = [c for c in ["Notes", "Cost/kg N"] if c in df.columns]
-    if meta_cols:
-        sel = df[
-            (df["Product"] == product) &
-            (df["Location"] == location) &
-            (df["Delivery Window"] == window)
-        ][["Supplier"] + meta_cols].copy()
     
         if not sel.empty:
             st.markdown("#### Notes / Cost of N (for selection)")
@@ -382,6 +368,18 @@ def _page_trader_pricing_impl(book_code: str):
             sorted(df["Delivery Window"].dropna().unique().tolist()),
             key=_ss_key(book_code, "pricing_window")
         )
+
+    meta_cols = [c for c in ["Notes", "Cost/kg N"] if c in df.columns]
+    if meta_cols:
+        sel = df[
+            (df["Product"] == product) &
+            (df["Location"] == location) &
+            (df["Delivery Window"] == window)
+        ][["Supplier"] + meta_cols].copy()
+    
+        if not sel.empty:
+            st.markdown("#### Notes / Cost of N (for selection)")
+            st.dataframe(sel, use_container_width=True, hide_index=True)
     
     with c4:
         qty = st.number_input(
@@ -1128,7 +1126,12 @@ def page_admin_orders():
         with c1:
             if st.button("Confirm as-is", type="primary", use_container_width=True):
                 try:
-                    admin_confirm_order(order_id, admin_user=st.session_state.get("user", "unknown"), expected_version=header["version"])
+                    admin_confirm_order(
+                        order_id,
+                        admin_user=st.session_state.get("user", "unknown"),
+                        admin_note=admin_note,
+                        expected_version=header["version"]
+                    )
                     st.success("Order CONFIRMED.")
                     st.rerun()
                 except Exception as e:
