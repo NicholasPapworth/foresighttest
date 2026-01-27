@@ -338,15 +338,8 @@ def _page_trader_pricing_impl(book_code: str):
         st.info("Basket expired and has been cleared.")
 
     st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
-    
-        if not sel.empty:
-            st.markdown("#### Notes / Cost of N (for selection)")
-            st.dataframe(sel, use_container_width=True, hide_index=True)
 
-    if book_code == "seed":
-        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
-    else:
-        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
+    c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
     
     with c1:
         product = st.selectbox(
@@ -368,7 +361,8 @@ def _page_trader_pricing_impl(book_code: str):
             sorted(df["Delivery Window"].dropna().unique().tolist()),
             key=_ss_key(book_code, "pricing_window")
         )
-
+    
+    # Notes / Cost/kg N (safe now)
     meta_cols = [c for c in ["Notes", "Cost/kg N"] if c in df.columns]
     if meta_cols:
         sel = df[
