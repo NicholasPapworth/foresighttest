@@ -349,16 +349,23 @@ def _page_trader_pricing_impl(book_code: str):
         )
     
     with c2:
+        loc_opts = sorted(
+            df.loc[df["Product"] == product, "Location"].dropna().unique().tolist()
+        )
         location = st.selectbox(
             "Location",
-            sorted(df["Location"].dropna().unique().tolist()),
+            loc_opts,
             key=_ss_key(book_code, "pricing_location")
         )
     
     with c3:
+        win_opts = sorted(
+            df.loc[(df["Product"] == product) & (df["Location"] == location), "Delivery Window"]
+              .dropna().unique().tolist()
+        )
         window = st.selectbox(
             "Delivery Window",
-            sorted(df["Delivery Window"].dropna().unique().tolist()),
+            win_opts,
             key=_ss_key(book_code, "pricing_window")
         )
     
@@ -976,7 +983,8 @@ def _page_admin_pricing_impl(book_code: str):
     
         # Editable preview: allow editing Sell Price only
         editable_cols = []
-        for col in ["Supplier", "Product Category", "Product", "Location", "Delivery Window", "Price", "Sell Price", "Unit"]:
+        for col in ["Supplier", "Product Category", "Product", "Location", "Delivery Window",
+            "Price", "Sell Price", "Unit", "Notes", "Cost/kg N"]:
             if col in dfp.columns:
                 editable_cols.append(col)
     
@@ -985,18 +993,22 @@ def _page_admin_pricing_impl(book_code: str):
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            disabled=[c for c in editable_cols if c != "Sell Price"],
+            disabled=[c for c in editable_cols if c != "Sell Price"],  # Notes/Cost remain disabled
             column_config={
                 "Price": st.column_config.NumberColumn("Base Price", format="£%.2f"),
                 "Sell Price": st.column_config.NumberColumn("Sell Price", min_value=0.0, step=0.5, format="£%.2f"),
+                "Notes": st.column_config.TextColumn("Notes"),
+                "Cost/kg N": st.column_config.TextColumn("Cost/kg N"),
             },
             key=_ss_key(book_code, "preview_editor")
         )
-    
-        # Save edited Sell Price back to preview
-        # (data_editor returns a df; persist it)
         st.session_state[preview_df_key] = edited.copy()
-    
+
+        to_pub = st.session_state[preview_df_key].copy()
+        for c in ["Notes", "Cost/kg N"]:
+            if c not in to_pub.columns:
+                to_pub[c] = ""
+            
         st.divider()
     
         # Publish button (ONLY publish from preview)
@@ -1008,6 +1020,10 @@ def _page_admin_pricing_impl(book_code: str):
         ):
             try:
                 to_pub = st.session_state[preview_df_key].copy()
+                for c in ["Notes", "Cost/kg N"]:
+                    if c not in to_pub.columns:
+                        to_pub[c] = ""
+                
                 # Ensure numeric + non-null
                 to_pub["Price"] = pd.to_numeric(to_pub["Price"], errors="coerce")
                 to_pub["Sell Price"] = pd.to_numeric(to_pub["Sell Price"], errors="coerce")
