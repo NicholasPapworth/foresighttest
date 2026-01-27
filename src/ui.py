@@ -344,29 +344,45 @@ def _page_trader_pricing_impl(book_code: str):
 
     st.caption(f"Using supplier snapshot: {sid[:8]} | Basket timeout: {timeout_min} min")
 
+    # Show notes / cost of N for the selected product/location/window
+    meta_cols = [c for c in ["Notes", "Cost/kg N"] if c in df.columns]
+    if meta_cols:
+        sel = df[
+            (df["Product"] == product) &
+            (df["Location"] == location) &
+            (df["Delivery Window"] == window)
+        ][["Supplier"] + meta_cols].copy()
+    
+        if not sel.empty:
+            st.markdown("#### Notes / Cost of N (for selection)")
+            st.dataframe(sel, use_container_width=True, hide_index=True)
+
     if book_code == "seed":
         c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
     else:
-       c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
-
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
+    
     with c1:
         product = st.selectbox(
             "Product",
             sorted(df["Product"].dropna().unique().tolist()),
             key=_ss_key(book_code, "pricing_product")
         )
+    
     with c2:
         location = st.selectbox(
             "Location",
             sorted(df["Location"].dropna().unique().tolist()),
             key=_ss_key(book_code, "pricing_location")
         )
+    
     with c3:
         window = st.selectbox(
             "Delivery Window",
             sorted(df["Delivery Window"].dropna().unique().tolist()),
             key=_ss_key(book_code, "pricing_window")
         )
+    
     with c4:
         qty = st.number_input(
             "Qty (t)",
@@ -374,20 +390,21 @@ def _page_trader_pricing_impl(book_code: str):
             value=10.0,
             step=1.0,
             key=_ss_key(book_code, "pricing_qty")
-
-            delivery_method = "Delivered"
-            if book_code == "fert":
-                with c5:
-                    delivery_method = st.selectbox(
-                        "Delivery method",
-                        options=delivery_options,
-                        index=delivery_options.index("Delivered") if "Delivered" in delivery_options else 0,
-                        key=_ss_key(book_code, "pricing_delivery_method"),
-                    )
-
+        )
+    
+    # Right-most selector depends on book
+    delivery_method = "Delivered"
     addons_selected = []
-    if book_code == "seed":
-        with c5:
+    
+    with c5:
+        if book_code == "fert":
+            delivery_method = st.selectbox(
+                "Delivery method",
+                options=delivery_options,
+                index=delivery_options.index("Delivered") if "Delivered" in delivery_options else 0,
+                key=_ss_key(book_code, "pricing_delivery_method"),
+            )
+        else:
             addons_selected = st.multiselect(
                 "Treatments (0–6)",
                 options=addons_options,
@@ -479,28 +496,28 @@ def _page_trader_pricing_impl(book_code: str):
         st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
 
     st.markdown("### Totals")
-    
+
     alloc_df = pd.DataFrame(res["allocation"])
     tonnes = float(pd.to_numeric(alloc_df["Qty"], errors="coerce").fillna(0.0).sum()) if not alloc_df.empty else 0.0
     tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
     
-        base_per_t = float(res["base_cost"]) / tonnes
-        lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
-        addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
+    base_per_t = float(res["base_cost"]) / tonnes
+    lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
+    addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
     
-        # Fertiliser delivery adjustment (negative = discount)
-        delivery_total = 0.0
-        delivery_per_t = 0.0
-        if book_code == "fert":
-            bdf2 = pd.DataFrame(st.session_state[basket_key])
-            if "Delivery Method" in bdf2.columns and not bdf2.empty:
-                for _, rr in bdf2.iterrows():
-                    dm = str(rr.get("Delivery Method", "Delivered"))
-                    q = float(rr.get("Qty", 0.0) or 0.0)
-                    delivery_total += float(delivery_delta_map.get(dm, 0.0)) * q
-            delivery_per_t = delivery_total / tonnes
+    # Fertiliser delivery adjustment (negative = discount)
+    delivery_total = 0.0
+    delivery_per_t = 0.0
+    if book_code == "fert":
+        bdf2 = pd.DataFrame(st.session_state[basket_key])
+        if "Delivery Method" in bdf2.columns and not bdf2.empty:
+            for _, rr in bdf2.iterrows():
+                dm = str(rr.get("Delivery Method", "Delivered"))
+                q = float(rr.get("Qty", 0.0) or 0.0)
+                delivery_total += float(delivery_delta_map.get(dm, 0.0)) * q
+        delivery_per_t = delivery_total / tonnes
     
-        total_per_t = (float(res["total"]) + delivery_total) / tonnes
+    total_per_t = (float(res["total"]) + delivery_total) / tonnes
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
@@ -1290,12 +1307,15 @@ def _page_trader_best_prices_impl(book_code: str):
             st.warning("Tick at least one line.")
         else:
             for _, r in selected.iterrows():
-                st.session_state[basket_key].append({
+                item = {
                     "Product": r["Product"],
                     "Location": r["Location"],
                     "Delivery Window": r["Window"],
                     "Qty": float(qty),
-                })
+                }
+                if book_code == "fert":
+                    item["Delivery Method"] = "Delivered"
+                st.session_state[basket_key].append(item)
             st.success(f"Added {len(selected)} line(s) to basket.")
             st.info("Go to Trader | Pricing to optimise and submit the order.")
             st.rerun()
