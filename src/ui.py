@@ -264,6 +264,127 @@ def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     best = best.sort_values(["Product Category", "Product", "Location", "Delivery Window"]).reset_index(drop=True)
     return best
 
+def _build_quote_lines(
+    book_code: str,
+    alloc_df: pd.DataFrame,
+    res: dict,
+    basket: list,
+    delivery_delta_map: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Returns (quote_lines_df, totals_dict)
+
+    quote_lines_df includes per-line: base sell, lot £/t, delivery £/t, addons £/t, all-in £/t, line totals.
+    Lot charge is applied per supplier and joined back to each allocation line.
+    """
+    if alloc_df is None or alloc_df.empty:
+        return pd.DataFrame(), {
+            "tonnes": 0.0,
+            "base_value": 0.0,
+            "lot_value": 0.0,
+            "addons_value": 0.0,
+            "delivery_value": 0.0,
+            "all_in_value": 0.0,
+        }
+
+    work = alloc_df.copy()
+
+    # ---- Normalise expected columns from optimiser output ----
+    # base sell column used by optimiser (typically "Price")
+    base_col = "Price" if "Price" in work.columns else None
+    if base_col is None:
+        # fallback if optimiser returns something else
+        for c in ["Sell Price", "sell_price", "sell"]:
+            if c in work.columns:
+                base_col = c
+                break
+    if base_col is None:
+        raise ValueError(f"Allocation is missing a base sell column. Columns: {list(work.columns)}")
+
+    # supplier and qty
+    if "Supplier" not in work.columns:
+        raise ValueError(f"Allocation is missing 'Supplier'. Columns: {list(work.columns)}")
+    if "Qty" not in work.columns:
+        raise ValueError(f"Allocation is missing 'Qty'. Columns: {list(work.columns)}")
+
+    work["Supplier"] = work["Supplier"].astype(str)
+    work["Qty"] = pd.to_numeric(work["Qty"], errors="coerce").fillna(0.0)
+    work["Base £/t"] = pd.to_numeric(work[base_col], errors="coerce").fillna(0.0)
+
+    # ---- Lot charge per supplier (£/t) from res["lot_charges"] ----
+    lot_map = {}
+    lc = res.get("lot_charges")
+    if lc:
+        lc_df = pd.DataFrame(lc).copy()
+
+        # Try common column names
+        sup_c = "Supplier" if "Supplier" in lc_df.columns else ("supplier" if "supplier" in lc_df.columns else None)
+
+        charge_c = None
+        for cand in ["Charge £/t", "charge_per_t", "charge", "Charge", "charge_per_t_gbp"]:
+            if cand in lc_df.columns:
+                charge_c = cand
+                break
+
+        if sup_c and charge_c:
+            lc_df[sup_c] = lc_df[sup_c].astype(str)
+            lc_df[charge_c] = pd.to_numeric(lc_df[charge_c], errors="coerce").fillna(0.0)
+            lot_map = dict(zip(lc_df[sup_c], lc_df[charge_c]))
+
+    work["Lot £/t"] = work["Supplier"].map(lot_map).fillna(0.0)
+
+    # ---- Delivery delta per line (fert only) ----
+    work["Delivery £/t"] = 0.0
+    if book_code == "fert":
+        # Build a lookup from basket for delivery method by (Product, Location, Delivery Window)
+        bdf = pd.DataFrame(basket) if basket else pd.DataFrame()
+        dm_lookup = {}
+        if not bdf.empty and all(c in bdf.columns for c in ["Product", "Location", "Delivery Window"]):
+            if "Delivery Method" in bdf.columns:
+                for _, r in bdf.iterrows():
+                    key = (str(r["Product"]), str(r["Location"]), str(r["Delivery Window"]))
+                    dm_lookup[key] = str(r.get("Delivery Method", "Delivered"))
+
+        def _dm_delta(row):
+            key = (str(row.get("Product", "")), str(row.get("Location", "")), str(row.get("Delivery Window", "")))
+            dm = dm_lookup.get(key, "Delivered")
+            return float(delivery_delta_map.get(dm, 0.0))
+
+        work["Delivery £/t"] = work.apply(_dm_delta, axis=1)
+
+    # ---- Addons per line (seed only) ----
+    work["Addons £/t"] = 0.0
+    # Optimiser in your screenshots uses "Addons £/t"
+    if "Addons £/t" in work.columns:
+        work["Addons £/t"] = pd.to_numeric(work["Addons £/t"], errors="coerce").fillna(0.0)
+    else:
+        # fallback if optimiser output differs
+        for cand in ["addons_per_t", "Addons_per_t", "Addons/t", "Addons £ per t"]:
+            if cand in work.columns:
+                work["Addons £/t"] = pd.to_numeric(work[cand], errors="coerce").fillna(0.0)
+                break
+
+    # ---- All-in per line ----
+    work["All-in £/t"] = work["Base £/t"] + work["Lot £/t"] + work["Delivery £/t"] + work["Addons £/t"]
+
+    # ---- Values ----
+    work["Base value"] = work["Base £/t"] * work["Qty"]
+    work["Lot value"] = work["Lot £/t"] * work["Qty"]
+    work["Delivery value"] = work["Delivery £/t"] * work["Qty"]
+    work["Addons value"] = work["Addons £/t"] * work["Qty"]
+    work["Line total"] = work["All-in £/t"] * work["Qty"]
+
+    tonnes = float(work["Qty"].sum())
+    totals = {
+        "tonnes": tonnes,
+        "base_value": float(work["Base value"].sum()),
+        "lot_value": float(work["Lot value"].sum()),
+        "delivery_value": float(work["Delivery value"].sum()),
+        "addons_value": float(work["Addons value"].sum()),
+        "all_in_value": float(work["Line total"].sum()),
+    }
+    return work, totals
+
 
 def page_trader_pricing():
     st.subheader("Trader | Pricing")
