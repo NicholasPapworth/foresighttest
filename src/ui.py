@@ -654,7 +654,20 @@ def _page_trader_pricing_impl(book_code: str):
 
     c3.metric("All-in £/t", f"£{total_per_t:,.2f}")
 
+
     st.divider()
+
+    # --- Lot charge map: Supplier -> charge_per_t (fert only) ---
+    lot_charge_per_t_map = {}
+    if book_code == "fert" and res.get("lot_charges"):
+        # res["lot_charges"] rows look like: Supplier, Tonnes, Charge £/t, Lot Charge
+        lcd = pd.DataFrame(res["lot_charges"])
+        # Defensive: handle either "Charge £/t" or "charge_per_t" naming
+        if "Charge £/t" in lcd.columns:
+            lot_charge_per_t_map = dict(zip(lcd["Supplier"], lcd["Charge £/t"]))
+        elif "charge_per_t" in lcd.columns:
+            lot_charge_per_t_map = dict(zip(lcd["Supplier"], lcd["charge_per_t"]))
+
     st.markdown("### Checkout")
 
     if book_code == "seed":
@@ -716,7 +729,15 @@ def _page_trader_pricing_impl(book_code: str):
                 delivery_method_line = dm
                 delivery_delta = float(delivery_delta_map.get(dm, 0.0))
 
-            sell_price = sell_price_base + delivery_delta
+            # --- Small-lot charge (fert only) applied per supplier ---
+            lot_charge_per_t = 0.0
+            lot_charge_value = 0.0
+            if book_code == "fert":
+                lot_charge_per_t = float(lot_charge_per_t_map.get(sup, 0.0))
+                lot_charge_value = lot_charge_per_t * qty
+
+            # All-in sell price per tonne for this line
+            sell_price = sell_price_base + delivery_delta + lot_charge_per_t
             unit = str(match.iloc[0]["Unit"])
             pcat = str(match.iloc[0].get("Product Category", ""))
 
@@ -732,6 +753,8 @@ def _page_trader_pricing_impl(book_code: str):
                 "Sell Price": sell_price,
                 "Delivery Method": delivery_method_line,
                 "Delivery Delta Per T": delivery_delta,
+                "Small Lot Charge Per T": lot_charge_per_t,
+                "Small Lot Charge Value": lot_charge_value,
             })
         try:
             user = st.session_state.get("user", "unknown")
