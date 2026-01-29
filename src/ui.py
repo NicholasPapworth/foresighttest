@@ -611,6 +611,53 @@ def _page_trader_pricing_impl(book_code: str):
     res = st.session_state[last_optim_key]
 
     st.markdown("### Optimal allocation (Sell prices)")
+
+    alloc_df = pd.DataFrame(res["allocation"])
+    st.dataframe(alloc_df, use_container_width=True, hide_index=True)
+
+    if res.get("lot_charges"):
+        st.markdown("### Small-lot charges")
+        st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
+
+    st.markdown("### Totals")
+
+    quote_lines_df, totals = _build_quote_lines(
+        book_code=book_code,
+        alloc_df=pd.DataFrame(res["allocation"]),
+        res=res,
+        basket=st.session_state[basket_key],
+        delivery_delta_map=delivery_delta_map,
+    )
+    
+    st.markdown("### Quote lines (final prices)")
+    show_cols = []
+    for c in ["Product","Location","Delivery Window","Qty","Supplier","Base £/t","Lot £/t","Delivery £/t","Addons £/t","All-in £/t","Line total"]:
+        if c in quote_lines_df.columns:
+            show_cols.append(c)
+    
+    st.dataframe(quote_lines_df[show_cols], use_container_width=True, hide_index=True)
+    
+    # Totals strip
+    tonnes = totals["tonnes"] if totals["tonnes"] else 1.0
+    base_per_t = totals["base_value"] / tonnes
+    lot_per_t = totals["lot_value"] / tonnes
+    delivery_per_t = totals["delivery_value"] / tonnes
+    addons_per_t = totals["addons_value"] / tonnes
+    all_in_per_t = totals["all_in_value"] / tonnes
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
+    
+    if book_code == "fert":
+        c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
+        st.caption(f"Delivery adjustment: £{delivery_per_t:,.2f}/t (applied after optimisation)")
+    else:
+        c2.metric("Treatments £/t", f"£{addons_per_t:,.2f}")
+    
+    c3.metric("All-in £/t", f"£{all_in_per_t:,.2f}")
+
+
+    
     st.divider()
 
     # --- Lot charge map: Supplier -> charge_per_t (fert only) ---
