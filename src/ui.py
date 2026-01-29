@@ -655,42 +655,6 @@ def _page_trader_pricing_impl(book_code: str):
     
     c3.metric("All-in £/t", f"£{all_in_per_t:,.2f}")
 
-
-    alloc_df = pd.DataFrame(res["allocation"])
-    tonnes = float(pd.to_numeric(alloc_df["Qty"], errors="coerce").fillna(0.0).sum()) if not alloc_df.empty else 0.0
-    tonnes = tonnes if tonnes > 0 else 1.0  # avoid div/0
-    
-    base_per_t = float(res["base_cost"]) / tonnes
-    lot_per_t  = float(res.get("lot_charge_total", 0.0)) / tonnes
-    addons_per_t = float(res.get("addons_total", 0.0)) / tonnes
-    
-    # Fertiliser delivery adjustment (negative = discount)
-    delivery_total = 0.0
-    delivery_per_t = 0.0
-    if book_code == "fert":
-        bdf2 = pd.DataFrame(st.session_state[basket_key])
-        if "Delivery Method" in bdf2.columns and not bdf2.empty:
-            for _, rr in bdf2.iterrows():
-                dm = str(rr.get("Delivery Method", "Delivered"))
-                q = float(rr.get("Qty", 0.0) or 0.0)
-                delivery_total += float(delivery_delta_map.get(dm, 0.0)) * q
-        delivery_per_t = delivery_total / tonnes
-    
-    total_per_t = (float(res["total"]) + delivery_total) / tonnes
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
-
-    if book_code == "fert":
-        c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
-        st.caption(f"Delivery adjustment: £{delivery_per_t:,.2f}/t (applied after optimisation)")
-
-    else:
-        c2.metric("Treatments £/t", f"£{addons_per_t:,.2f}")
-
-    c3.metric("All-in £/t", f"£{total_per_t:,.2f}")
-
-
     st.divider()
 
     # --- Lot charge map: Supplier -> charge_per_t (fert only) ---
