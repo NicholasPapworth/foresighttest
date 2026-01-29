@@ -653,28 +653,7 @@ def _page_trader_pricing_impl(book_code: str):
         styler = styler.set_properties(subset=["All-in £/t"], **{"font-weight": "700"})
 
     st.dataframe(styler, use_container_width=True, hide_index=True)
-    
-    # Totals strip
-    tonnes = totals["tonnes"] if totals["tonnes"] else 1.0
-    base_per_t = totals["base_value"] / tonnes
-    lot_per_t = totals["lot_value"] / tonnes
-    delivery_per_t = totals["delivery_value"] / tonnes
-    addons_per_t = totals["addons_value"] / tonnes
-    all_in_per_t = totals["all_in_value"] / tonnes
-    
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Sell price (base) £/t", f"£{base_per_t:,.2f}")
-    
-    if book_code == "fert":
-        c2.metric("Small-lot £/t", f"£{lot_per_t:,.2f}")
-        st.caption(f"Delivery adjustment: £{delivery_per_t:,.2f}/t (applied after optimisation)")
-    else:
-        c2.metric("Treatments £/t", f"£{addons_per_t:,.2f}")
-    
-    c3.metric("All-in £/t", f"£{all_in_per_t:,.2f}")
 
-
-    
     st.divider()
 
     # --- Lot charge map: Supplier -> charge_per_t (fert only) ---
