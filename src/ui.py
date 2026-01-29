@@ -610,13 +610,13 @@ def _page_trader_pricing_impl(book_code: str):
 
     res = st.session_state[last_optim_key]
 
-    st.markdown("### Optimal allocation's")
+    st.markdown("### Optimal Allocation's")
 
     alloc_df = pd.DataFrame(res["allocation"])
     st.dataframe(alloc_df, use_container_width=True, hide_index=True)
 
     if res.get("lot_charges"):
-        st.markdown("### Small-lot charges")
+        st.markdown("### Small-Lot Charges")
         st.dataframe(pd.DataFrame(res["lot_charges"]), use_container_width=True, hide_index=True)
 
     st.markdown("### Totals")
@@ -629,7 +629,7 @@ def _page_trader_pricing_impl(book_code: str):
         delivery_delta_map=delivery_delta_map,
     )
     
-    st.markdown("### Your ADM Quote")
+    st.markdown("### Your ADM Quote(s)")
     show_cols = []
     for c in ["Product","Location","Delivery Window","Qty","Supplier","Base £/t","Lot £/t","Delivery £/t","Addons £/t","All-in £/t","Line total"]:
         if c in quote_lines_df.columns:
