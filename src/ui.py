@@ -629,7 +629,7 @@ def _page_trader_pricing_impl(book_code: str):
         delivery_delta_map=delivery_delta_map,
     )
     
-    st.markdown("### Quote lines (final prices)")
+    st.markdown("### Your ADM Quote")
     show_cols = []
     for c in ["Product","Location","Delivery Window","Qty","Supplier","Base £/t","Lot £/t","Delivery £/t","Addons £/t","All-in £/t","Line total"]:
         if c in quote_lines_df.columns:
