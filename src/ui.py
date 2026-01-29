@@ -1377,7 +1377,7 @@ def _page_history_impl(book_code: str):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def page_trader_best_prices():
-    st.subheader("Trader | Best Prices")
+    st.subheader("Trader | FULL LOAD PRICES")
 
     tab_f, tab_s = st.tabs(["Fertiliser", "Seed"])
     with tab_f:
