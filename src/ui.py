@@ -635,7 +635,24 @@ def _page_trader_pricing_impl(book_code: str):
         if c in quote_lines_df.columns:
             show_cols.append(c)
     
-    st.dataframe(quote_lines_df[show_cols], use_container_width=True, hide_index=True)
+    quote_view = quote_lines_df[show_cols].copy()
+
+    # Optional: format money columns nicely
+    money_cols = ["Base £/t", "Lot £/t", "Delivery £/t", "Addons £/t", "All-in £/t", "Line total"]
+    fmt = {}
+    for c in money_cols:
+        if c in quote_view.columns:
+            fmt[c] = "£{:,.2f}".format
+    if "Qty" in quote_view.columns:
+        fmt["Qty"] = "{:,.2f}".format
+
+    styler = quote_view.style.format(fmt)
+
+    # Bold the All-in column
+    if "All-in £/t" in quote_view.columns:
+        styler = styler.set_properties(subset=["All-in £/t"], **{"font-weight": "700"})
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
     
     # Totals strip
     tonnes = totals["tonnes"] if totals["tonnes"] else 1.0
