@@ -610,7 +610,7 @@ def _page_trader_pricing_impl(book_code: str):
 
     res = st.session_state[last_optim_key]
 
-    st.markdown("### Optimal allocation (Sell prices)")
+    st.markdown("### Optimal allocation's")
 
     alloc_df = pd.DataFrame(res["allocation"])
     st.dataframe(alloc_df, use_container_width=True, hide_index=True)
