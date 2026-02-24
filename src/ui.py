@@ -277,6 +277,13 @@ def _inject_offer_css():
         unsafe_allow_html=True,
     )
 
+def _norm_postcode(pc: str) -> str:
+    return str(pc or "").strip().upper().replace(" ", "")
+
+def _norm_product(p: str) -> str:
+    # normalise product keys for stock mapping
+    return str(p or "").strip()
+
 def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns best (lowest) SELL price per:
@@ -535,7 +542,7 @@ def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postco
 
     # Prep lookup: product -> stores list
     sp = sp.copy()
-    sp["product"] = sp["product"].fillna("").astype(str)
+    sp["product"] = sp["product"].fillna("").astype(str).map(_norm_product)
     sp["store_id"] = sp["store_id"].astype(str)
 
     stores = stores.copy()
@@ -543,7 +550,7 @@ def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postco
     stores["name"] = stores.get("name", "").fillna("").astype(str)
     stores["postcode"] = stores.get("postcode", "").fillna("").astype(str)
 
-    store_by_id = {r["store_id"]: r for _, r in stores.iterrows()}
+    store_by_id = {r["store_id"]: r.to_dict() for _, r in stores.iterrows()}
 
     product_to_store_ids = {}
     for _, r in sp.iterrows():
@@ -558,7 +565,7 @@ def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postco
         if r["Supplier"] != STOCK_SUPPLIER_NAME:
             continue
 
-        prod = str(r["Product"])
+        prod = _norm_product(r["Product"])
         cand_ids = list(product_to_store_ids.get(prod, []))
         if not cand_ids:
             # no store has this product -> remove STOCK row by setting price huge
@@ -568,8 +575,8 @@ def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postco
         # Find nearest store by road miles
         best = None
         for sid in cand_ids:
-            s = store_by_id.get(str(sid))
-            if not s:
+            s = store_by_id.get(sid)
+            if s is None:
                 continue
             s_post = str(s.get("postcode", "")).strip()
             if not s_post:
@@ -822,7 +829,7 @@ def _page_pricing_impl(book_code: str, role_code: str):
     if book_code == "fert":
         sp = list_stock_store_products(active_only=True)
         if sp is not None and not sp.empty:
-            active_stock_products = set(sp["product"].astype(str).tolist())
+            active_stock_products = set(sp["product"].astype(str).map(_norm_product).tolist())
         df_off = _inject_stock_rows(df_off, active_stock_products)
 
     settings = get_settings()
