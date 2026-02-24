@@ -27,6 +27,7 @@ from src.ui import (
     page_admin_blotter,
     page_admin_supplier_analysis,
     page_admin_user_data,
+    page_admin_stock,
 )
 
 # MUST be first Streamlit call
