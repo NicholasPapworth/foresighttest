@@ -2848,7 +2848,6 @@ def page_admin_stock():
 
     with tab1:
         st.markdown("### Stores")
-        st.caption("Maintain physical stock nodes. Lat/Lon can be left blank initially; we can auto-fill later.")
         edited = st.data_editor(
             stores,
             use_container_width=True,
@@ -2865,8 +2864,6 @@ def page_admin_stock():
 
     with tab2:
         st.markdown("### Store → Products")
-        st.caption("Long-form mapping: one row per (store, product). Keep it simple; quantities optional.")
-
         # Build store_id choices
         store_id_opts = stores["store_id"].astype(str).tolist() if stores is not None and not stores.empty else []
 
@@ -2900,7 +2897,6 @@ def page_admin_stock():
             st.rerun()
 
         st.markdown("#### Bands (charge £/t)")
-        st.caption("Example: 0–10, 10–20 … up to breakpoint. Sort order controls precedence.")
         edited3 = st.data_editor(
             bands,
             use_container_width=True,
