@@ -154,6 +154,78 @@ def init_db():
     );
     """)
 
+        # --- Stock stores (pseudo-supplier STOCK) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS stock_stores (
+        store_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        postcode TEXT NOT NULL,
+        lat REAL,
+        lon REAL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at_utc TEXT NOT NULL,
+        created_by TEXT NOT NULL
+    );
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_stock_stores_active
+    ON stock_stores (active);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS stock_store_products (
+        store_id TEXT NOT NULL,
+        product TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        qty_t REAL,
+        updated_at_utc TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        PRIMARY KEY (store_id, product),
+        FOREIGN KEY (store_id) REFERENCES stock_stores(store_id)
+    );
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_stock_store_products_product
+    ON stock_store_products (product, active);
+    """)
+
+    # --- Haulage tariff for stock (two-tier: bands up to break, then per-mile) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS haulage_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        break_miles REAL NOT NULL,
+        per_mile_per_t REAL NOT NULL,
+        updated_at_utc TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS haulage_bands (
+        band_id TEXT PRIMARY KEY,
+        min_miles REAL NOT NULL,
+        max_miles REAL NOT NULL,
+        charge_per_t REAL NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_haulage_bands_active
+    ON haulage_bands (active, sort_order);
+    """)
+
+    # Seed defaults if empty
+    cur.execute("SELECT COUNT(*) FROM haulage_settings;")
+    if cur.fetchone()[0] == 0:
+        cur.execute("""
+            INSERT INTO haulage_settings (id, break_miles, per_mile_per_t, updated_at_utc, updated_by)
+            VALUES (1, 100.0, 0.10, ?, ?)
+        """, (utc_now_iso(), "system"))
+
     # ---- MIGRATION: add role_code to price_margins if missing ----
     try:
         cur.execute("ALTER TABLE price_margins ADD COLUMN role_code TEXT NOT NULL DEFAULT 'trader';")
@@ -447,6 +519,243 @@ def save_fert_delivery_options(df: pd.DataFrame, user: str):
                 INSERT INTO fert_delivery_options (name, delta_per_t, active, created_at_utc, created_by)
                 VALUES (?, ?, ?, ?, ?)
             """, (nm, dp, ac, now, user))
+
+    c.commit()
+    c.close()
+
+def list_stock_stores(active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT store_id, name, postcode, lat, lon, active, created_at_utc, created_by
+            FROM stock_stores
+            WHERE active = 1
+            ORDER BY name ASC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT store_id, name, postcode, lat, lon, active, created_at_utc, created_by
+            FROM stock_stores
+            ORDER BY name ASC
+        """, c)
+    c.close()
+    return df
+
+
+def save_stock_stores(df: pd.DataFrame, user: str):
+    """
+    expects cols: name, postcode, lat, lon, active
+    - upserts by name (unique-enough for internal tool)
+    - generates store_id for new rows
+    """
+    import uuid as _uuid
+
+    work = df.copy()
+    for col in ["name", "postcode"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in stock stores editor.")
+
+    work["name"] = work["name"].fillna("").astype(str).str.strip()
+    work["postcode"] = work["postcode"].fillna("").astype(str).str.strip()
+    work = work[(work["name"] != "") & (work["postcode"] != "")].copy()
+
+    if "lat" not in work.columns:
+        work["lat"] = None
+    if "lon" not in work.columns:
+        work["lon"] = None
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+
+    lowered = work["name"].str.lower()
+    if lowered.duplicated().any():
+        dups = work.loc[lowered.duplicated(), "name"].tolist()
+        raise ValueError(f"Duplicate store names detected: {dups}")
+
+    c = conn()
+    cur = c.cursor()
+    now = utc_now_iso()
+
+    # mark all inactive then re-apply actives (same pattern as other admin lists)
+    cur.execute("UPDATE stock_stores SET active = 0;")
+
+    for _, r in work.iterrows():
+        nm = str(r["name"]).strip()
+        pc = str(r["postcode"]).strip()
+        lat = r["lat"]
+        lon = r["lon"]
+        ac = int(r["active"])
+
+        cur.execute("SELECT store_id FROM stock_stores WHERE name = ?", (nm,))
+        ex = cur.fetchone()
+        if ex:
+            cur.execute("""
+                UPDATE stock_stores
+                SET postcode = ?, lat = ?, lon = ?, active = ?
+                WHERE name = ?
+            """, (pc, lat, lon, ac, nm))
+        else:
+            cur.execute("""
+                INSERT INTO stock_stores (store_id, name, postcode, lat, lon, active, created_at_utc, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (str(_uuid.uuid4()), nm, pc, lat, lon, ac, now, user))
+
+    c.commit()
+    c.close()
+
+
+def list_stock_store_products(active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT store_id, product, active, qty_t, updated_at_utc, updated_by
+            FROM stock_store_products
+            WHERE active = 1
+            ORDER BY product ASC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT store_id, product, active, qty_t, updated_at_utc, updated_by
+            FROM stock_store_products
+            ORDER BY product ASC
+        """, c)
+    c.close()
+    return df
+
+
+def save_stock_store_products(df: pd.DataFrame, user: str):
+    """
+    expects cols: store_id, product, active (qty_t optional)
+    - soft reset active=0 then upsert
+    """
+    work = df.copy()
+    for col in ["store_id", "product"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in store products editor.")
+
+    work["store_id"] = work["store_id"].fillna("").astype(str).str.strip()
+    work["product"] = work["product"].fillna("").astype(str).str.strip()
+    work = work[(work["store_id"] != "") & (work["product"] != "")].copy()
+
+    if "qty_t" not in work.columns:
+        work["qty_t"] = None
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+
+    c = conn()
+    cur = c.cursor()
+    now = utc_now_iso()
+
+    cur.execute("UPDATE stock_store_products SET active = 0;")
+
+    for _, r in work.iterrows():
+        sid = str(r["store_id"]).strip()
+        prod = str(r["product"]).strip()
+        ac = int(r["active"])
+        qty = r["qty_t"]
+        cur.execute("""
+            INSERT INTO stock_store_products (store_id, product, active, qty_t, updated_at_utc, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(store_id, product) DO UPDATE SET
+                active = excluded.active,
+                qty_t = excluded.qty_t,
+                updated_at_utc = excluded.updated_at_utc,
+                updated_by = excluded.updated_by
+        """, (sid, prod, ac, qty, now, user))
+
+    c.commit()
+    c.close()
+
+
+def get_haulage_settings() -> dict:
+    c = conn()
+    df = pd.read_sql_query("SELECT break_miles, per_mile_per_t FROM haulage_settings WHERE id = 1", c)
+    c.close()
+    if df.empty:
+        return {"break_miles": 100.0, "per_mile_per_t": 0.10}
+    return {"break_miles": float(df.loc[0, "break_miles"]), "per_mile_per_t": float(df.loc[0, "per_mile_per_t"])}
+
+
+def set_haulage_settings(break_miles: float, per_mile_per_t: float, user: str):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO haulage_settings (id, break_miles, per_mile_per_t, updated_at_utc, updated_by)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            break_miles = excluded.break_miles,
+            per_mile_per_t = excluded.per_mile_per_t,
+            updated_at_utc = excluded.updated_at_utc,
+            updated_by = excluded.updated_by
+    """, (float(break_miles), float(per_mile_per_t), utc_now_iso(), user))
+    c.commit()
+    c.close()
+
+
+def list_haulage_bands(active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    if active_only:
+        df = pd.read_sql_query("""
+            SELECT band_id, min_miles, max_miles, charge_per_t, active, sort_order
+            FROM haulage_bands
+            WHERE active = 1
+            ORDER BY sort_order ASC, min_miles ASC
+        """, c)
+    else:
+        df = pd.read_sql_query("""
+            SELECT band_id, min_miles, max_miles, charge_per_t, active, sort_order
+            FROM haulage_bands
+            ORDER BY sort_order ASC, min_miles ASC
+        """, c)
+    c.close()
+    return df
+
+
+def save_haulage_bands(df: pd.DataFrame, user: str):
+    import uuid as _uuid
+
+    work = df.copy()
+    for col in ["min_miles", "max_miles", "charge_per_t"]:
+        if col not in work.columns:
+            raise ValueError(f"Missing column '{col}' in haulage bands editor.")
+
+    if "band_id" not in work.columns:
+        work["band_id"] = ""
+
+    if "active" not in work.columns:
+        work["active"] = 1
+    if "sort_order" not in work.columns:
+        work["sort_order"] = 0
+
+    work["min_miles"] = pd.to_numeric(work["min_miles"], errors="coerce")
+    work["max_miles"] = pd.to_numeric(work["max_miles"], errors="coerce")
+    work["charge_per_t"] = pd.to_numeric(work["charge_per_t"], errors="coerce")
+    work = work.dropna(subset=["min_miles", "max_miles", "charge_per_t"]).copy()
+
+    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
+    work["sort_order"] = pd.to_numeric(work["sort_order"], errors="coerce").fillna(0).astype(int)
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE haulage_bands SET active = 0;")
+
+    for _, r in work.iterrows():
+        bid = str(r.get("band_id") or "").strip()
+        if not bid:
+            bid = str(_uuid.uuid4())
+        cur.execute("""
+            INSERT INTO haulage_bands (band_id, min_miles, max_miles, charge_per_t, active, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(band_id) DO UPDATE SET
+                min_miles = excluded.min_miles,
+                max_miles = excluded.max_miles,
+                charge_per_t = excluded.charge_per_t,
+                active = excluded.active,
+                sort_order = excluded.sort_order
+        """, (bid, float(r["min_miles"]), float(r["max_miles"]), float(r["charge_per_t"]), int(r["active"]), int(r["sort_order"])))
 
     c.commit()
     c.close()
@@ -1946,6 +2255,7 @@ def deactivate_offer(offer_id: int):
     cur.execute("UPDATE todays_offers SET active = 0 WHERE offer_id = ?", (int(offer_id),))
     c.commit()
     c.close()
+
 
 
 
