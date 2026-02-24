@@ -756,6 +756,16 @@ def _build_quote_lines(
                 work.at[i, "Stock Store"] = str(m.get("store_name", ""))
                 work.at[i, "Stock Miles"] = float(m.get("miles", 0.0))
 
+    # IMPORTANT: Optimiser "Price" for STOCK already includes haulage (we add it in _apply_stock_pricing_with_routing).
+    # For quote breakdown we want Base £/t EX haulage, so subtract it back out for STOCK lines.
+    if book_code == "fert" and "Supplier" in work.columns and "Base £/t" in work.columns:
+        is_stock = work["Supplier"].astype(str) == STOCK_SUPPLIER_NAME
+        if is_stock.any():
+            work.loc[is_stock, "Base £/t"] = (
+                work.loc[is_stock, "Base £/t"] - work.loc[is_stock, "Stock Haulage £/t"]
+            )
+            work.loc[is_stock, "Base £/t"] = work.loc[is_stock, "Base £/t"].clip(lower=0.0)
+
     # ---- All-in per line ----
     work["All-in £/t"] = (
         work["Base £/t"] +
