@@ -396,46 +396,72 @@ def _apply_role_margins(df: pd.DataFrame, role_code: str) -> pd.DataFrame:
 
 def _inject_stock_rows(df_prices: pd.DataFrame, active_stock_products: set[str]) -> pd.DataFrame:
     """
-    Add pseudo-supplier STOCK rows for any products configured as "active" in Admin | Stock.
-    STOCK rows are duplicates of existing rows but with Supplier="STOCK".
-    We set Price as Sell Price baseline (before haulage), then later we add haulage via routing.
+    Create ONE pseudo-supplier STOCK row per (Product, Location, Delivery Window)
+    for any products configured as active in Admin | Stock.
+
+    Baseline "Price" for STOCK rows is the cheapest available Effective Sell Price
+    among real suppliers for that same (Product, Location, Window). Haulage is added later.
     """
     if df_prices is None or df_prices.empty:
         return df_prices
-
     if not active_stock_products:
         return df_prices
 
     df = df_prices.copy()
 
-    # Only create stock rows for configured products
-    df = df.copy()
+    # Must have these columns to be meaningful
+    needed = ["Product", "Location", "Delivery Window", "Supplier"]
+    for c in needed:
+        if c not in df.columns:
+            return df_prices  # fail safe: don't inject stock if schema unexpected
+
     df["Product"] = df["Product"].fillna("").astype(str)
+    df["Location"] = df["Location"].fillna("").astype(str)
+    df["Delivery Window"] = df["Delivery Window"].fillna("").astype(str)
+    df["Supplier"] = df["Supplier"].fillna("").astype(str)
+
+    # Use Effective Sell Price if present, else Sell Price, else Price
+    price_source = None
+    for cand in ["Effective Sell Price", "Sell Price", "Price"]:
+        if cand in df.columns:
+            price_source = cand
+            break
+    if price_source is None:
+        return df_prices
+
+    df[price_source] = pd.to_numeric(df[price_source], errors="coerce").fillna(0.0)
 
     stock_base = df[df["Product"].isin(active_stock_products)].copy()
     if stock_base.empty:
         return df_prices
 
-    # Create STOCK rows; keep same Product/Location/Window/Unit
-    stock_rows = stock_base.copy()
+    group_cols = ["Product", "Location", "Delivery Window"]
+
+    # Pick the single cheapest row per group as baseline for STOCK
+    idx = stock_base.groupby(group_cols)[price_source].idxmin()
+    stock_rows = stock_base.loc[idx].copy()
+
+    # Make it a STOCK supplier row
     stock_rows["Supplier"] = STOCK_SUPPLIER_NAME
 
-    # For optimiser we use column "Price". We will later replace Price for STOCK with "sell + haulage".
-    # If caller already has Price set to Effective Sell Price (renamed), keep it.
-    if "Price" not in stock_rows.columns:
-        if "Sell Price" in stock_rows.columns:
-            stock_rows["Price"] = pd.to_numeric(stock_rows["Sell Price"], errors="coerce").fillna(0.0)
-        else:
-            stock_rows["Price"] = 0.0
-    else:
-        stock_rows["Price"] = pd.to_numeric(stock_rows["Price"], errors="coerce").fillna(0.0)
+    # Optimiser uses column "Price"
+    stock_rows["Price"] = pd.to_numeric(stock_rows[price_source], errors="coerce").fillna(0.0)
+
+    # Keep these for downstream display / consistency
+    if "Sell Price" in stock_rows.columns:
+        stock_rows["Sell Price"] = stock_rows["Price"]
+    if "Effective Sell Price" in stock_rows.columns:
+        stock_rows["Effective Sell Price"] = stock_rows["Price"]
 
     # Ensure required cols exist
-    for c in ["Location", "Delivery Window", "Unit", "Product Category"]:
+    for c in ["Unit", "Product Category"]:
         if c not in stock_rows.columns:
             stock_rows[c] = ""
 
-    out = pd.concat([df_prices, stock_rows], ignore_index=True)
+    # IMPORTANT: drop any existing STOCK rows first to avoid duplicates on reruns
+    df_no_stock = df_prices[df_prices["Supplier"].astype(str) != STOCK_SUPPLIER_NAME].copy()
+
+    out = pd.concat([df_no_stock, stock_rows], ignore_index=True)
     return out
 
 
