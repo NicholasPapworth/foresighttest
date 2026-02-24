@@ -80,6 +80,7 @@ if role in ("wholesaler", "admin"):
 if role == "admin":
     pages.update({
         "Admin | Pricing": page_admin_pricing,
+        "Admin | Stock": page_admin_stock,
         "Admin | Orders": page_admin_orders,
         "Admin | Blotter": page_admin_blotter,
         "Admin | Supplier Analysis": page_admin_supplier_analysis,
