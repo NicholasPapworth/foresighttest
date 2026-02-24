@@ -41,11 +41,21 @@ from src.db import (
     presence_session_summary,
 )
 
+from src.db import (
+    list_stock_stores, save_stock_stores,
+    list_stock_store_products, save_stock_store_products,
+    get_haulage_settings, set_haulage_settings,
+    list_haulage_bands, save_haulage_bands,
+)
+
+from src import routing
+
 from src.validation import load_supplier_sheet, load_seed_sheet
 from src.optimizer import optimise_basket
 from src.pricing import apply_margins
 
 LOGO_PATH = "assets/logo.svg"
+STOCK_SUPPLIER_NAME = "STOCK"
 
 def show_boot_splash(video_path: str | None = None, seconds: float = 4.8):
     """
@@ -384,6 +394,186 @@ def _apply_role_margins(df: pd.DataFrame, role_code: str) -> pd.DataFrame:
     out = apply_margins(out, margins)
     return out
 
+def _inject_stock_rows(df_prices: pd.DataFrame, active_stock_products: set[str]) -> pd.DataFrame:
+    """
+    Add pseudo-supplier STOCK rows for any products configured as "active" in Admin | Stock.
+    STOCK rows are duplicates of existing rows but with Supplier="STOCK".
+    We set Price as Sell Price baseline (before haulage), then later we add haulage via routing.
+    """
+    if df_prices is None or df_prices.empty:
+        return df_prices
+
+    if not active_stock_products:
+        return df_prices
+
+    df = df_prices.copy()
+
+    # Only create stock rows for configured products
+    df = df.copy()
+    df["Product"] = df["Product"].fillna("").astype(str)
+
+    stock_base = df[df["Product"].isin(active_stock_products)].copy()
+    if stock_base.empty:
+        return df_prices
+
+    # Create STOCK rows; keep same Product/Location/Window/Unit
+    stock_rows = stock_base.copy()
+    stock_rows["Supplier"] = STOCK_SUPPLIER_NAME
+
+    # For optimiser we use column "Price". We will later replace Price for STOCK with "sell + haulage".
+    # If caller already has Price set to Effective Sell Price (renamed), keep it.
+    if "Price" not in stock_rows.columns:
+        if "Sell Price" in stock_rows.columns:
+            stock_rows["Price"] = pd.to_numeric(stock_rows["Sell Price"], errors="coerce").fillna(0.0)
+        else:
+            stock_rows["Price"] = 0.0
+    else:
+        stock_rows["Price"] = pd.to_numeric(stock_rows["Price"], errors="coerce").fillna(0.0)
+
+    # Ensure required cols exist
+    for c in ["Location", "Delivery Window", "Unit", "Product Category"]:
+        if c not in stock_rows.columns:
+            stock_rows[c] = ""
+
+    out = pd.concat([df_prices, stock_rows], ignore_index=True)
+    return out
+
+
+def _haulage_per_t(miles: float, bands: pd.DataFrame, break_miles: float, per_mile_per_t: float) -> float:
+    """
+    Two-tier haulage:
+      - if miles <= break_miles -> use band charge (£/t) from bands table
+      - if miles > break_miles -> band charge at break + (miles-break)*per_mile_per_t
+    """
+    m = float(miles or 0.0)
+
+    # Normalise bands
+    b = bands.copy() if bands is not None else pd.DataFrame()
+    if not b.empty:
+        for col in ["min_miles", "max_miles", "charge_per_t"]:
+            if col not in b.columns:
+                b[col] = None
+        b["min_miles"] = pd.to_numeric(b["min_miles"], errors="coerce").fillna(0.0)
+        b["max_miles"] = pd.to_numeric(b["max_miles"], errors="coerce")
+        b["charge_per_t"] = pd.to_numeric(b["charge_per_t"], errors="coerce").fillna(0.0)
+        if "active" in b.columns:
+            b = b[b["active"].astype(int) == 1]
+        b = b.sort_values(["min_miles", "max_miles"], ascending=True)
+
+    brk = float(break_miles or 0.0)
+    per = float(per_mile_per_t or 0.0)
+
+    def band_charge(x: float) -> float:
+        if b.empty:
+            return 0.0
+        hit = b[(b["min_miles"] <= x) & ((b["max_miles"].isna()) | (x < b["max_miles"]))].head(1)
+        if hit.empty:
+            # If no band matches, fall back to last band charge
+            return float(b["charge_per_t"].iloc[-1])
+        return float(hit["charge_per_t"].iloc[0])
+
+    if m <= brk:
+        return band_charge(m)
+
+    # beyond breakpoint: band at breakpoint + linear add
+    base = band_charge(brk)
+    return base + ((m - brk) * per)
+
+
+def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postcode: str) -> tuple[pd.DataFrame, dict]:
+    """
+    For STOCK rows only:
+      - choose nearest store that has the product
+      - compute road miles (routing.get_road_miles)
+      - compute haulage (£/t)
+      - add haulage onto Price (so optimiser can compare vs real suppliers)
+    Returns:
+      (priced_df, stock_meta)
+    stock_meta is keyed by (Product, Location, Delivery Window) -> {store_name, miles, haulage_per_t}
+    """
+    df = sell_prices.copy()
+    df["Supplier"] = df["Supplier"].fillna("").astype(str)
+    df["Product"] = df["Product"].fillna("").astype(str)
+    df["Location"] = df["Location"].fillna("").astype(str)
+    df["Delivery Window"] = df["Delivery Window"].fillna("").astype(str)
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+
+    stores = list_stock_stores(active_only=True)
+    sp = list_stock_store_products(active_only=True)
+    settings = get_haulage_settings()
+    bands = list_haulage_bands(active_only=True)
+
+    # Nothing to do if no stores/products configured
+    if stores is None or stores.empty or sp is None or sp.empty:
+        return df[df["Supplier"] != STOCK_SUPPLIER_NAME].copy(), {}
+
+    # Prep lookup: product -> stores list
+    sp = sp.copy()
+    sp["product"] = sp["product"].fillna("").astype(str)
+    sp["store_id"] = sp["store_id"].astype(str)
+
+    stores = stores.copy()
+    stores["store_id"] = stores["store_id"].astype(str)
+    stores["name"] = stores.get("name", "").fillna("").astype(str)
+    stores["postcode"] = stores.get("postcode", "").fillna("").astype(str)
+
+    store_by_id = {r["store_id"]: r for _, r in stores.iterrows()}
+
+    product_to_store_ids = {}
+    for _, r in sp.iterrows():
+        product_to_store_ids.setdefault(r["product"], set()).add(r["store_id"])
+
+    break_miles = float(settings.get("break_miles", 0.0))
+    per_mile_per_t = float(settings.get("per_mile_per_t", 0.0))
+
+    stock_meta = {}
+
+    for i, r in df.iterrows():
+        if r["Supplier"] != STOCK_SUPPLIER_NAME:
+            continue
+
+        prod = str(r["Product"])
+        cand_ids = list(product_to_store_ids.get(prod, []))
+        if not cand_ids:
+            # no store has this product -> remove STOCK row by setting price huge
+            df.at[i, "Price"] = 1e12
+            continue
+
+        # Find nearest store by road miles
+        best = None
+        for sid in cand_ids:
+            s = store_by_id.get(str(sid))
+            if not s:
+                continue
+            s_post = str(s.get("postcode", "")).strip()
+            if not s_post:
+                continue
+
+            miles = float(routing.get_road_miles(s_post, delivery_postcode))
+            if best is None or miles < best["miles"]:
+                best = {"store_id": sid, "store_name": str(s.get("name", "")), "miles": miles}
+
+        if best is None:
+            df.at[i, "Price"] = 1e12
+            continue
+
+        haul = _haulage_per_t(best["miles"], bands=bands, break_miles=break_miles, per_mile_per_t=per_mile_per_t)
+
+        # Add haulage onto price
+        df.at[i, "Price"] = float(df.at[i, "Price"]) + float(haul)
+
+        # Save meta for audit in quote lines + submit
+        k = (str(r["Product"]), str(r["Location"]), str(r["Delivery Window"]))
+        stock_meta[k] = {
+            "store_name": best["store_name"],
+            "miles": float(best["miles"]),
+            "haulage_per_t": float(haul),
+        }
+
+    # Remove "unpriceable" STOCK rows (where we set huge sentinel)
+    df = df[df["Price"] < 1e11].copy()
+    return df, stock_meta
+
 def _norm_col(c: str) -> str:
     # normalise column names to avoid £ / NBSP / trailing whitespace mismatches
     return (
@@ -520,7 +710,36 @@ def _build_quote_lines(
 
 
     # ---- All-in per line ----
-    work["All-in £/t"] = work["Base £/t"] + work["Lot £/t"] + work["Delivery £/t"] + work["Addons £/t"]
+     # ---- STOCK haulage (fert only; only applies when Supplier == STOCK) ----
+    work["Stock Haulage £/t"] = 0.0
+    work["Stock Store"] = ""
+    work["Stock Miles"] = 0.0
+
+    if book_code == "fert":
+        meta = res.get("stock_meta") or {}
+        # meta keyed by (Product, Location, Delivery Window)
+        if meta and all(c in work.columns for c in ["Product", "Location", "Delivery Window"]):
+            for i, r in work.iterrows():
+                if str(r["Supplier"]) != STOCK_SUPPLIER_NAME:
+                    continue
+                k = (str(r["Product"]), str(r["Location"]), str(r["Delivery Window"]))
+                m = meta.get(k)
+                if not m:
+                    continue
+                work.at[i, "Stock Haulage £/t"] = float(m.get("haulage_per_t", 0.0))
+                work.at[i, "Stock Store"] = str(m.get("store_name", ""))
+                work.at[i, "Stock Miles"] = float(m.get("miles", 0.0))
+
+    # ---- All-in per line ----
+    work["All-in £/t"] = (
+        work["Base £/t"] +
+        work["Lot £/t"] +
+        work["Delivery £/t"] +
+        work["Addons £/t"] +
+        work["Stock Haulage £/t"]
+    )
+
+    work["Stock haulage value"] = work["Stock Haulage £/t"] * work["Qty"]
 
     # ---- Values ----
     work["Base value"] = work["Base £/t"] * work["Qty"]
@@ -536,6 +755,7 @@ def _build_quote_lines(
         "lot_value": float(work["Lot value"].sum()),
         "delivery_value": float(work["Delivery value"].sum()),
         "addons_value": float(work["Addons value"].sum()),
+        "stock_haulage_value": float(work["Stock haulage value"].sum()),
         "all_in_value": float(work["Line total"].sum()),
     }
     return work, totals
@@ -561,6 +781,14 @@ def _page_pricing_impl(book_code: str, role_code: str):
     _inject_offer_css()
     df_off = _apply_offers_to_prices_df(book_code, df)
 
+    # --- Inject STOCK pseudo-supplier rows for fertiliser ---
+    active_stock_products = set()
+    if book_code == "fert":
+        sp = list_stock_store_products(active_only=True)
+        if sp is not None and not sp.empty:
+            active_stock_products = set(sp["product"].astype(str).tolist())
+        df_off = _inject_stock_rows(df_off, active_stock_products)
+
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
     tiers = get_small_lot_tiers()
@@ -582,6 +810,14 @@ def _page_pricing_impl(book_code: str, role_code: str):
         if "Delivered" not in delivery_delta_map:
             delivery_options = ["Delivered"] + [x for x in delivery_options if x != "Delivered"]
             delivery_delta_map["Delivered"] = 0.0
+
+    delivery_postcode = ""
+    if book_code == "fert":
+        delivery_postcode = st.text_input(
+            "Delivery postcode (required to price STOCK lines)",
+            key=_ss_key(book_code, "delivery_postcode"),
+            placeholder="e.g. LN1 1AB",
+        )
 
     # ---- Seed add-ons (treatments) ----
     # Only required for Seed book. Provides:
@@ -736,6 +972,19 @@ def _page_pricing_impl(book_code: str, role_code: str):
             # Use offer-adjusted sell prices (Effective Sell Price)
             sell_prices = df_off[["Supplier", "Product", "Location", "Delivery Window", "Effective Sell Price"]].copy()
             sell_prices = sell_prices.rename(columns={"Effective Sell Price": "Price"})
+            sell_prices["Supplier"] = sell_prices["Supplier"].astype(str)
+
+            stock_meta = {}
+
+            if book_code == "fert":
+                pc = (delivery_postcode or "").strip()
+
+                # If no postcode, STOCK must not be eligible in the optimiser
+                if not pc:
+                    sell_prices = sell_prices[sell_prices["Supplier"] != STOCK_SUPPLIER_NAME].copy()
+                else:
+                    # Price STOCK rows with nearest-store haulage and keep meta for audit
+                    sell_prices, stock_meta = _apply_stock_pricing_with_routing(sell_prices, pc)
 
             if book_code == "fert":
                 res = optimise_basket(
@@ -751,6 +1000,10 @@ def _page_pricing_impl(book_code: str, role_code: str):
                     tiers=None,
                     addons_catalog=addons_catalog
                 )
+             # attach stock meta (used later for quote-line audit)
+            if stock_meta:
+                res["stock_meta"] = stock_meta
+                res["delivery_postcode"] = (delivery_postcode or "").strip()
 
             if not res.get("ok"):
                 st.error(res.get("error", "Unknown error"))
@@ -788,7 +1041,7 @@ def _page_pricing_impl(book_code: str, role_code: str):
     
     st.markdown("### Your ADM Quote(s)")
     show_cols = []
-    for c in ["Product","Location","Delivery Window","Qty","Supplier","Base £/t","Lot £/t","Delivery £/t","Addons £/t","All-in £/t","Line total"]:
+    for c in ["Product","Location","Delivery Window","Qty","Supplier","Base £/t","Lot £/t","Delivery £/t","Addons £/t","Stock Haulage £/t","Stock Store","Stock Miles","All-in £/t","Line total"]:
         if c in quote_lines_df.columns:
             show_cols.append(c)
     
@@ -954,7 +1207,20 @@ def _page_pricing_impl(book_code: str, role_code: str):
                         pass
 
             # All-in sell price per tonne for this line
-            sell_price = sell_price_base + delivery_delta + lot_charge_per_t + addons_per_t
+            # --- STOCK haulage per t (fert only; only if Supplier == STOCK) ---
+            stock_haul_per_t = 0.0
+            stock_store = ""
+            stock_miles = 0.0
+            
+            if book_code == "fert" and sup == STOCK_SUPPLIER_NAME:
+                meta = (res.get("stock_meta") or {})
+                k = (str(prod), str(loc), str(win))
+                m = meta.get(k)
+                if m:
+                    stock_haul_per_t = float(m.get("haulage_per_t", 0.0))
+                    stock_store = str(m.get("store_name", ""))
+                    stock_miles = float(m.get("miles", 0.0))
+            sell_price = sell_price_base + delivery_delta + lot_charge_per_t + addons_per_t + stock_haul_per_t
             unit = str(match.iloc[0]["Unit"])
             pcat = str(match.iloc[0].get("Product Category", ""))
 
@@ -974,6 +1240,11 @@ def _page_pricing_impl(book_code: str, role_code: str):
                 "Small Lot Charge Value": lot_charge_value,
                 "Addons Per T": addons_per_t,
                 "Addons Value": addons_per_t * qty,
+                "Stock Haulage Per T": stock_haul_per_t,
+                "Stock Haulage Value": stock_haul_per_t * qty,
+                "Stock Store": stock_store,
+                "Stock Miles": stock_miles,
+                "Delivery Postcode": (res.get("delivery_postcode") or ""),
             })
         try:
             user = st.session_state.get("user", "unknown")
@@ -2515,6 +2786,91 @@ def page_admin_supplier_analysis():
 
     _page_admin_supplier_analysis_impl(book_code=book_code)
 
+def page_admin_stock():
+    st.subheader("Admin | Stock")
+    st.session_state["presence_context"] = "fert"
+
+    user = st.session_state.get("user") or st.session_state.get("username") or ""
+
+    stores = list_stock_stores(active_only=False)
+    store_products = list_stock_store_products(active_only=False)
+    bands = list_haulage_bands(active_only=False)
+    settings = get_haulage_settings()
+
+    # Build product universe from latest fert snapshot (best UX)
+    _, fert_df = _get_latest_prices_df_for("fert")
+    product_universe = sorted(fert_df["Product"].dropna().astype(str).unique().tolist()) if fert_df is not None and not fert_df.empty else []
+
+    tab1, tab2, tab3 = st.tabs(["Stores", "Store Products", "Haulage Tariff"])
+
+    with tab1:
+        st.markdown("### Stores")
+        st.caption("Maintain physical stock nodes. Lat/Lon can be left blank initially; we can auto-fill later.")
+        edited = st.data_editor(
+            stores,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "active": st.column_config.CheckboxColumn("active"),
+            },
+        )
+        if st.button("Save stores", type="primary"):
+            save_stock_stores(edited, user=user or "admin")
+            st.success("Saved stores.")
+            st.rerun()
+
+    with tab2:
+        st.markdown("### Store → Products")
+        st.caption("Long-form mapping: one row per (store, product). Keep it simple; quantities optional.")
+
+        # Build store_id choices
+        store_id_opts = stores["store_id"].astype(str).tolist() if stores is not None and not stores.empty else []
+
+        edited2 = st.data_editor(
+            store_products,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "store_id": st.column_config.SelectboxColumn("store_id", options=store_id_opts),
+                "product": st.column_config.SelectboxColumn("product", options=product_universe) if product_universe else None,
+                "active": st.column_config.CheckboxColumn("active"),
+            },
+        )
+        if st.button("Save store products", type="primary"):
+            save_stock_store_products(edited2, user=user or "admin")
+            st.success("Saved store products.")
+            st.rerun()
+
+    with tab3:
+        st.markdown("### Haulage tariff")
+        c1, c2 = st.columns(2)
+        with c1:
+            break_miles = st.number_input("Band breakpoint miles", min_value=0.0, value=float(settings["break_miles"]), step=1.0)
+        with c2:
+            per_mile = st.number_input("£/mile/t beyond breakpoint", min_value=0.0, value=float(settings["per_mile_per_t"]), step=0.01, format="%.2f")
+
+        if st.button("Save haulage settings", type="primary"):
+            set_haulage_settings(break_miles, per_mile, user=user or "admin")
+            st.success("Saved haulage settings.")
+            st.rerun()
+
+        st.markdown("#### Bands (charge £/t)")
+        st.caption("Example: 0–10, 10–20 … up to breakpoint. Sort order controls precedence.")
+        edited3 = st.data_editor(
+            bands,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "active": st.column_config.CheckboxColumn("active"),
+            },
+        )
+        if st.button("Save haulage bands", type="primary", key="save_haulage_bands"):
+            save_haulage_bands(edited3, user=user or "admin")
+            st.success("Saved bands.")
+            st.rerun()
 
 def _page_admin_supplier_analysis_impl(book_code: str):
     st.markdown("### Supplier Analysis")
