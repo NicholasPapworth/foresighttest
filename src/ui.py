@@ -281,8 +281,8 @@ def _norm_postcode(pc: str) -> str:
     return str(pc or "").strip().upper().replace(" ", "")
 
 def _norm_product(p: str) -> str:
-    # normalise product keys for stock mapping
-    return str(p or "").strip()
+    # normalise product keys for matching across snapshots + stock config
+    return str(p or "").strip().lower()
 
 def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -438,7 +438,9 @@ def _inject_stock_rows(df_prices: pd.DataFrame, active_stock_products: set[str])
 
     df[price_source] = pd.to_numeric(df[price_source], errors="coerce").fillna(0.0)
 
-    stock_base = df[df["Product"].isin(active_stock_products)].copy()
+    # match using normalised product names
+    df["_norm_product"] = df["Product"].map(_norm_product)
+    stock_base = df[df["_norm_product"].isin({ _norm_product(x) for x in active_stock_products })].copy()
     if stock_base.empty:
         return df_prices
 
@@ -469,6 +471,10 @@ def _inject_stock_rows(df_prices: pd.DataFrame, active_stock_products: set[str])
     df_no_stock = df_prices[df_prices["Supplier"].astype(str) != STOCK_SUPPLIER_NAME].copy()
 
     out = pd.concat([df_no_stock, stock_rows], ignore_index=True)
+
+    if "_norm_product" in out.columns:
+        out = out.drop(columns=["_norm_product"], errors="ignore")
+
     return out
 
 
@@ -829,8 +835,9 @@ def _page_pricing_impl(book_code: str, role_code: str):
     if book_code == "fert":
         sp = list_stock_store_products(active_only=True)
         if sp is not None and not sp.empty:
-            active_stock_products = set(sp["product"].astype(str).map(_norm_product).tolist())
-        df_off = _inject_stock_rows(df_off, active_stock_products)
+            active_stock_products = set(sp["product"].astype(str).tolist())
+            df_off = _inject_stock_rows(df_off, active_stock_products)
+            st.caption(f"DEBUG: rows={len(df_off)} | stock_rows={(df_off['Supplier'].astype(str) == STOCK_SUPPLIER_NAME).sum()}")
 
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
