@@ -1,22 +1,21 @@
 import time
 import streamlit as st
 import pandas as pd
+import altair as alt
 import uuid
 import base64
 import streamlit.components.v1 as components
 from pathlib import Path
-from datetime import datetime, timezone
-from src.db import presence_heartbeat, list_online_users
+from datetime import datetime, timezone, timedelta
+from src.db import list_online_users
 
 from src.db import (
     get_settings, set_setting,
     get_small_lot_tiers, save_small_lot_tiers,
 
-    # Fertiliser snapshot functions (existing)
     latest_supplier_snapshot, list_supplier_snapshots,
     load_supplier_prices, publish_supplier_snapshot,
 
-    # Seed snapshot functions
     latest_seed_snapshot, list_seed_snapshots,
     load_seed_prices, publish_seed_snapshot, list_seed_treatments, save_seed_treatments,
 
@@ -28,7 +27,18 @@ from src.db import (
     trader_cancel_order, trader_accept_counter,
     admin_counter_order, admin_confirm_order, admin_reject_order, admin_mark_filled,
     admin_blotter_lines,
-    admin_margin_report
+    admin_margin_report,
+
+    list_active_offers, list_offers, create_offer, deactivate_offer,
+)
+
+from src.db import (
+    list_distinct_presence_users,
+    list_distinct_presence_pages,
+    list_presence_events,
+    presence_daily_logins,
+    presence_daily_page_transitions,
+    presence_session_summary,
 )
 
 from src.validation import load_supplier_sheet, load_seed_sheet
@@ -159,6 +169,22 @@ BOOKS = {
 
 BOOKS_BY_CODE = {v["code"]: v for v in BOOKS.values()}
 
+def _pick_book(page_key: str, default: str = "fert") -> str:
+    """
+    Returns 'fert' or 'seed' based on a single UI selector.
+    This avoids st.tabs() executing BOTH branches and corrupting presence_context.
+    """
+    labels = ["Fertiliser", "Seed"]
+    default_idx = 0 if default == "fert" else 1
+
+    choice = st.selectbox(
+        "Book",
+        options=labels,
+        index=default_idx,
+        key=f"{page_key}__book",
+    )
+    return "fert" if choice == "Fertiliser" else "seed"
+
 
 def _ss_key(book_code: str, name: str) -> str:
     """Namespaced session_state key so Fert and Seed don't clash."""
@@ -233,6 +259,14 @@ def render_header():
 
     st.divider()
 
+def _inject_offer_css():
+    st.markdown(
+        """<style>
+.offer-red { color: #d11 !important; font-weight: 700 !important; }
+</style>""",
+        unsafe_allow_html=True,
+    )
+
 def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns best (lowest) SELL price per:
@@ -264,6 +298,116 @@ def _best_prices_board(df: pd.DataFrame) -> pd.DataFrame:
     best = best.sort_values(["Product Category", "Product", "Location", "Delivery Window"]).reset_index(drop=True)
     return best
 
+def _apply_offers_to_prices_df(book_code: str, df_prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - Effective Sell Price (used for optimisation + board)
+      - Offer Active (bool)
+      - Offer Ends (iso str)
+      - Offer Title
+    Expects df has: Supplier, Product, Location, Delivery Window, Sell Price
+    """
+    offers = list_active_offers(book_code)
+    out = df_prices.copy()
+
+    out["Offer Active"] = False
+    out["Offer Ends"] = ""
+    out["Offer Title"] = ""
+    out["Effective Sell Price"] = pd.to_numeric(out["Sell Price"], errors="coerce").fillna(0.0)
+
+    if offers is None or offers.empty:
+        return out
+
+    # Normalise keys
+    offers = offers.copy()
+    offers["product"] = offers["product"].fillna("").astype(str)
+    offers["location"] = offers["location"].fillna("").astype(str)
+    offers["delivery_window"] = offers["delivery_window"].fillna("").astype(str)
+    offers["supplier"] = offers["supplier"].fillna("").astype(str)
+
+    out["Supplier"] = out["Supplier"].fillna("").astype(str)
+    out["Product"] = out["Product"].fillna("").astype(str)
+    out["Location"] = out["Location"].fillna("").astype(str)
+    out["Delivery Window"] = out["Delivery Window"].fillna("").astype(str)
+
+    for i, r in out.iterrows():
+        prod = r["Product"]
+        loc = r["Location"]
+        win = r["Delivery Window"]
+        sup = r["Supplier"]
+
+        cand = offers[
+            (offers["product"] == prod) &
+            (offers["location"] == loc) &
+            (offers["delivery_window"] == win) &
+            ((offers["supplier"] == "") | (offers["supplier"] == sup))
+        ]
+        if cand.empty:
+            continue
+
+        # If multiple match: soonest expiry wins
+        cand = cand.sort_values("ends_at_utc", ascending=True).iloc[0]
+
+        base = float(out.at[i, "Effective Sell Price"])
+        mode = str(cand["mode"])
+        val = float(cand["value"])
+
+        if mode == "delta":
+            eff = max(0.0, base - val)
+        else:  # fixed
+            eff = max(0.0, val)
+
+        out.at[i, "Effective Sell Price"] = eff
+        out.at[i, "Offer Active"] = True
+        out.at[i, "Offer Ends"] = str(cand["ends_at_utc"])
+        out.at[i, "Offer Title"] = str(cand.get("title", "") or "")
+
+    return out
+
+def _apply_role_margins(df: pd.DataFrame, role_code: str) -> pd.DataFrame:
+    """
+    Compute Sell Price from base Price using role-specific margins.
+    Traders/wholesalers never need to see base Price, but we can still compute from it.
+    """
+    out = df.copy()
+
+    if "Price" not in out.columns:
+        # fallback: if snapshot somehow lacks Price, keep existing Sell Price as-is
+        if "Sell Price" not in out.columns:
+            out["Sell Price"] = 0.0
+        return out
+
+    out["Price"] = pd.to_numeric(out["Price"], errors="coerce")
+    out["Sell Price"] = out["Price"]  # always recompute from base for the role
+
+    margins = get_effective_margins(role_code=role_code)
+    out = apply_margins(out, margins)
+    return out
+
+def _norm_col(c: str) -> str:
+    # normalise column names to avoid £ / NBSP / trailing whitespace mismatches
+    return (
+        str(c)
+        .replace("\u00a0", " ")   # NBSP -> space
+        .strip()
+        .lower()
+    )
+
+def _find_col(df: pd.DataFrame, *candidates: str) -> str | None:
+    """
+    Find a column in df by normalised name.
+    candidates should be raw strings like 'Addons £/t', 'addons_per_t', etc.
+    """
+    if df is None or df.empty:
+        return None
+
+    norm_map = {_norm_col(c): c for c in df.columns}
+    for cand in candidates:
+        hit = norm_map.get(_norm_col(cand))
+        if hit:
+            return hit
+    return None
+
 def _build_quote_lines(
     book_code: str,
     alloc_df: pd.DataFrame,
@@ -288,6 +432,8 @@ def _build_quote_lines(
         }
 
     work = alloc_df.copy()
+    work.columns = [str(c).replace("\u00a0"," ").strip() for c in work.columns]
+
 
     # ---- Normalise expected columns from optimiser output ----
     # base sell column used by optimiser (typically "Price")
@@ -333,7 +479,7 @@ def _build_quote_lines(
 
     work["Lot £/t"] = work["Supplier"].map(lot_map).fillna(0.0)
 
-    # ---- Delivery delta per line (fert only) ----
+     # ---- Delivery delta per line (fert only) ----
     work["Delivery £/t"] = 0.0
     if book_code == "fert":
         # Build a lookup from basket for delivery method by (Product, Location, Delivery Window)
@@ -343,7 +489,8 @@ def _build_quote_lines(
             if "Delivery Method" in bdf.columns:
                 for _, r in bdf.iterrows():
                     key = (str(r["Product"]), str(r["Location"]), str(r["Delivery Window"]))
-                    dm_lookup[key] = str(r.get("Delivery Method", "Delivered"))
+                    if key not in dm_lookup:  # keep first match only
+                        dm_lookup[key] = str(r.get("Delivery Method", "Delivered"))
 
         def _dm_delta(row):
             key = (str(row.get("Product", "")), str(row.get("Location", "")), str(row.get("Delivery Window", "")))
@@ -352,17 +499,25 @@ def _build_quote_lines(
 
         work["Delivery £/t"] = work.apply(_dm_delta, axis=1)
 
-    # ---- Addons per line (seed only) ----
-    work["Addons £/t"] = 0.0
-    # Optimiser in your screenshots uses "Addons £/t"
-    if "Addons £/t" in work.columns:
-        work["Addons £/t"] = pd.to_numeric(work["Addons £/t"], errors="coerce").fillna(0.0)
+    # ---- Addons per line (seed optimiser output) ----
+    # NOTE: this must run for BOTH books (Seed uses it, Fert usually 0)
+    addons_col = _find_col(
+        work,
+        "Addons £/t",
+        "Addons £ per t",
+        "Addons/t",
+        "addons_per_t",
+        "addons per t",
+        "addons",
+        "addon £/t",
+        "addon_per_t",
+    )
+
+    if addons_col is None:
+        work["Addons £/t"] = 0.0
     else:
-        # fallback if optimiser output differs
-        for cand in ["addons_per_t", "Addons_per_t", "Addons/t", "Addons £ per t"]:
-            if cand in work.columns:
-                work["Addons £/t"] = pd.to_numeric(work[cand], errors="coerce").fillna(0.0)
-                break
+        work["Addons £/t"] = pd.to_numeric(work[addons_col], errors="coerce").fillna(0.0)
+
 
     # ---- All-in per line ----
     work["All-in £/t"] = work["Base £/t"] + work["Lot £/t"] + work["Delivery £/t"] + work["Addons £/t"]
@@ -389,19 +544,22 @@ def _build_quote_lines(
 def page_trader_pricing():
     st.subheader("Trader | Pricing")
 
-    tab_f, tab_s = st.tabs(["Fertiliser", "Seed"])
+    book_code = _pick_book("trader_pricing", default="fert")
+    st.session_state["presence_context"] = book_code
 
-    with tab_f:
-        _page_trader_pricing_impl(book_code="fert")
+    _page_pricing_impl(book_code=book_code, role_code="trader")
 
-    with tab_s:
-        _page_trader_pricing_impl(book_code="seed")
-
-def _page_trader_pricing_impl(book_code: str):
+def _page_pricing_impl(book_code: str, role_code: str):
     sid, df = _get_latest_prices_df_for(book_code)
-    if df is None:
+    if df is None or df.empty:
         st.warning("No supplier snapshot available. Admin must publish one.")
         return
+
+    # role-based Sell Price
+    df = _apply_role_margins(df, role_code=role_code)
+
+    _inject_offer_css()
+    df_off = _apply_offers_to_prices_df(book_code, df)
 
     settings = get_settings()
     timeout_min = int(settings.get("basket_timeout_minutes", "20"))
@@ -542,6 +700,7 @@ def _page_trader_pricing_impl(book_code: str):
             return
 
         item = {
+            "line_id": str(uuid.uuid4()),
             "Product": product,
             "Location": location,
             "Delivery Window": window,
@@ -574,10 +733,9 @@ def _page_trader_pricing_impl(book_code: str):
 
     with colB:
         if st.button("Optimise", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_optimise")):
-            price_col = "Sell Price" if "Sell Price" in df.columns else "Price"
-            sell_prices = df[["Supplier", "Product", "Location", "Delivery Window", price_col]].rename(
-                columns={price_col: "Price"}
-            )
+            # Use offer-adjusted sell prices (Effective Sell Price)
+            sell_prices = df_off[["Supplier", "Product", "Location", "Delivery Window", "Effective Sell Price"]].copy()
+            sell_prices = sell_prices.rename(columns={"Effective Sell Price": "Price"})
 
             if book_code == "fert":
                 res = optimise_basket(
@@ -604,13 +762,12 @@ def _page_trader_pricing_impl(book_code: str):
             st.rerun()
 
     # Show optimisation result if available
-    if last_optim_key not in st.session_state or st.session_state.get(last_optim_snap_key) != sid:
+    res = st.session_state.get(last_optim_key)
+    if (not res) or (st.session_state.get(last_optim_snap_key) != sid):
         st.info("Optimise to generate an allocation before checkout.")
         return
 
-    res = st.session_state[last_optim_key]
-
-    st.markdown("### Optimal Allocation's")
+    st.markdown("### Optimal Allocations")
 
     alloc_df = pd.DataFrame(res["allocation"])
     st.dataframe(alloc_df, use_container_width=True, hide_index=True)
@@ -637,6 +794,40 @@ def _page_trader_pricing_impl(book_code: str):
     
     quote_view = quote_lines_df[show_cols].copy()
 
+    # ----- Offer detection for quote lines -----
+    offers_now = list_active_offers(book_code)
+    offer_keys_any = set()
+    offer_keys_sup = set()
+
+    if offers_now is not None and not offers_now.empty:
+        for _, rr in offers_now.iterrows():
+            # (Product, Location, Window)
+            offer_keys_any.add((str(rr["product"]), str(rr["location"]), str(rr["delivery_window"])))
+            # (Product, Location, Window, Supplier) if supplier specified
+            sup = str(rr.get("supplier", "") or "")
+            if sup.strip():
+                offer_keys_sup.add((str(rr["product"]), str(rr["location"]), str(rr["delivery_window"]), sup))
+
+    def _is_offer_row(row) -> bool:
+        p = str(row.get("Product", ""))
+        l = str(row.get("Location", ""))
+        w = str(row.get("Delivery Window", ""))
+        s = str(row.get("Supplier", ""))
+        return ((p, l, w) in offer_keys_any) or ((p, l, w, s) in offer_keys_sup)
+
+    quote_view["Offer"] = quote_view.apply(_is_offer_row, axis=1)
+
+    # Force rerun so blink actually updates (1s)
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=1000, key=_ss_key(book_code, "quote_blink_refresh"))
+    except Exception:
+        pass
+
+    # Blink toggle (works reliably): changes every second
+    blink_on = (int(time.time()) % 2) == 0
+
+
     # Optional: format money columns nicely
     money_cols = ["Base £/t", "Lot £/t", "Delivery £/t", "Addons £/t", "All-in £/t", "Line total"]
     fmt = {}
@@ -647,6 +838,20 @@ def _page_trader_pricing_impl(book_code: str):
         fmt["Qty"] = "{:,.2f}".format
 
     styler = quote_view.style.format(fmt)
+
+    # Red + "blink" (by alternating style every second)
+    if "Offer" in quote_view.columns:
+        if blink_on:
+            styler = styler.apply(
+                lambda r: ["color:#d11; font-weight:700;" if bool(r.get("Offer")) else "" for _ in r],
+                axis=1
+            )
+        else:
+            # alternate state: still red but slightly lighter
+            styler = styler.apply(
+                lambda r: ["color:#d11; font-weight:700; opacity:0.60;" if bool(r.get("Offer")) else "" for _ in r],
+                axis=1
+            )
 
     # Bold the All-in column
     if "All-in £/t" in quote_view.columns:
@@ -691,24 +896,25 @@ def _page_trader_pricing_impl(book_code: str):
             sup = r["Supplier"]
             qty = float(r["Qty"])
 
-            match = df[
-                (df["Product"] == prod) &
-                (df["Location"] == loc) &
-                (df["Delivery Window"] == win)
+            # Use offer-adjusted data
+            match = df_off[
+                (df_off["Product"] == prod) &
+                (df_off["Location"] == loc) &
+                (df_off["Delivery Window"] == win) &
+                (df_off["Supplier"] == sup)
             ].copy()
-
-            match = match[match["Supplier"] == sup]
+            
             if match.empty:
-                st.error(f"Internal error: could not find base row for {prod}/{loc}/{win}/{sup}")
+                st.error(f"Internal error: could not find price row for {prod}/{loc}/{win}/{sup}")
                 return
+            
+            sell_price_base = float(match.iloc[0]["Effective Sell Price"])
 
             base_col = "Price" if "Price" in match.columns else ("Base Price" if "Base Price" in match.columns else None)
             if base_col is None:
                 st.error("Internal error: missing base price column (expected 'Price' or 'Base Price').")
                 return
             base_price = float(match.iloc[0][base_col])
-
-            sell_price_base = float(match.iloc[0]["Sell Price"]) if "Sell Price" in match.columns else float(match.iloc[0]["Price"])
 
             # Apply delivery delta (fert only)
             delivery_method_line = ""
@@ -722,7 +928,7 @@ def _page_trader_pricing_impl(book_code: str):
                         (bdf2["Product"] == prod) &
                         (bdf2["Location"] == loc) &
                         (bdf2["Delivery Window"] == win)
-                    ]
+                    ].iloc[:1]
                     if not hit.empty:
                         dm = str(hit.iloc[0].get("Delivery Method", "Delivered"))
                 delivery_method_line = dm
@@ -736,7 +942,19 @@ def _page_trader_pricing_impl(book_code: str):
                 lot_charge_value = lot_charge_per_t * qty
 
             # All-in sell price per tonne for this line
-            sell_price = sell_price_base + delivery_delta + lot_charge_per_t
+            # --- Addons per t (seed optimiser output) ---
+            # For fert this will be 0.0; for seed it should come from optimiser allocation.
+            addons_per_t = 0.0
+            for k in ["Addons £/t", "Addons £ per t", "addons_per_t", "Addons/t", "addons"]:
+                if k in r and r[k] is not None:
+                    try:
+                        addons_per_t = float(r[k])
+                        break
+                    except Exception:
+                        pass
+
+            # All-in sell price per tonne for this line
+            sell_price = sell_price_base + delivery_delta + lot_charge_per_t + addons_per_t
             unit = str(match.iloc[0]["Unit"])
             pcat = str(match.iloc[0].get("Product Category", ""))
 
@@ -754,6 +972,8 @@ def _page_trader_pricing_impl(book_code: str):
                 "Delivery Delta Per T": delivery_delta,
                 "Small Lot Charge Per T": lot_charge_per_t,
                 "Small Lot Charge Value": lot_charge_value,
+                "Addons Per T": addons_per_t,
+                "Addons Value": addons_per_t * qty,
             })
         try:
             user = st.session_state.get("user", "unknown")
@@ -854,11 +1074,10 @@ def page_admin_pricing():
 
     st.subheader("Admin | Pricing")
 
-    tab_f, tab_s = st.tabs(["Fertiliser", "Seed"])
-    with tab_f:
-        _page_admin_pricing_impl(book_code="fert")
-    with tab_s:
-        _page_admin_pricing_impl(book_code="seed")
+    book_code = _pick_book("admin_pricing", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_admin_pricing_impl(book_code=book_code)
 
 def _page_admin_pricing_impl(book_code: str):
     settings = get_settings()
@@ -973,7 +1192,14 @@ def _page_admin_pricing_impl(book_code: str):
     st.divider()
 
     st.markdown("### Admin margins")
-    mdf = list_margins(active_only=True)
+
+    margin_role = st.selectbox(
+        "Margins apply to role",
+        options=["trader", "wholesaler"],
+        index=0,
+        key=_ss_key(book_code, "admin_margin_role"),
+    )
+    mdf = list_margins(active_only=True, role_code=margin_role)
     if mdf.empty:
         st.info("No active margins set.")
     else:
@@ -996,7 +1222,7 @@ def _page_admin_pricing_impl(book_code: str):
     margin_per_t = st.number_input("Margin (£/t)", value=0.0, step=0.5, key=_ss_key(book_code, "margin_per_t"))
     if st.button("Add margin", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_add_margin")):
         try:
-            add_margin(scope_type, scope_value, float(margin_per_t), st.session_state.get("user", "unknown"))
+            add_margin(scope_type, scope_value, float(margin_per_t), st.session_state.get("user", "unknown"), role_code=margin_role)
             st.success("Margin added.")
             st.rerun()
         except Exception as e:
@@ -1020,7 +1246,7 @@ def _page_admin_pricing_impl(book_code: str):
                 return
 
             # 2) Apply margins to compute new Sell Price
-            margins = get_effective_margins()
+            margins = get_effective_margins(role_code=margin_role)
             tmp = df_latest.copy()
 
             # Ensure Sell Price exists and starts from base
@@ -1095,7 +1321,7 @@ def _page_admin_pricing_impl(book_code: str):
         with cA:
             if st.button("Apply current margins to Sell Price", use_container_width=True, key=_ss_key(book_code, "btn_apply_margins_preview")):
                 try:
-                    margins = get_effective_margins()
+                    margins = get_effective_margins(role_code=margin_role)
             
                     tmp = dfp.copy()
                     # apply_margins expects 'Price' and returns/sets 'Sell Price'
@@ -1343,21 +1569,382 @@ def page_admin_orders():
     else:
         st.dataframe(rep, use_container_width=True, hide_index=True)
 
-
-def page_history():
-    st.subheader("History")
-
-    tab_f, tab_s = st.tabs(["Fertiliser", "Seed"])
-    with tab_f:
-        _page_history_impl(book_code="fert")
-    with tab_s:
-        _page_history_impl(book_code="seed")
-
-def _page_history_impl(book_code: str):
+@st.cache_data(show_spinner=False)
+def _build_history_timeseries(book_code: str, role_code: str, max_snaps: int = 80) -> pd.DataFrame:
+    """
+    Builds a long history table for charting:
+    one row per snapshot x price row.
+    Uses Sell Price only (never exposes base Price to traders).
+    """
     snaps = BOOKS_BY_CODE[book_code]["list_snapshots"]()
-    if snaps.empty:
+    if snaps is None or snaps.empty:
+        return pd.DataFrame()
+
+    snaps = snaps.copy()
+    snaps["published_at_utc_dt"] = pd.to_datetime(snaps["published_at_utc"], errors="coerce", utc=True)
+    snaps = snaps.dropna(subset=["published_at_utc_dt"]).sort_values("published_at_utc_dt", ascending=True)
+
+    snaps = snaps.tail(int(max_snaps))
+
+    rows = []
+    for _, s in snaps.iterrows():
+        sid = s["snapshot_id"]
+        ts = s["published_at_utc_dt"]
+
+        df = BOOKS_BY_CODE[book_code]["load_prices"](sid)
+        if df is None or df.empty:
+            continue
+
+        df = df.copy()
+
+        # Require base Price
+        if "Price" not in df.columns:
+            continue
+        
+        df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+        df = df.dropna(subset=["Price"])
+        
+        # Recompute Sell Price for THIS role from base + effective margins
+        df["Sell Price"] = df["Price"]
+        margins = get_effective_margins(role_code=role_code)
+
+        df["Sell Price"] = pd.to_numeric(df["Sell Price"], errors="coerce")
+        df = apply_margins(df, margins)
+        df = df.dropna(subset=["Sell Price"])
+
+        keep_cols = [c for c in ["Product", "Location", "Delivery Window", "Supplier", "Unit"] if c in df.columns]
+        df = df[keep_cols + ["Sell Price"]].copy()
+
+        df["snapshot_id"] = sid
+        df["published_at_utc"] = ts
+
+        rows.append(df)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.concat(rows, ignore_index=True)
+
+@st.cache_data(show_spinner=False)
+def _build_history_timeseries_admin_base(book_code: str, max_snaps: int = 180) -> pd.DataFrame:
+    """
+    Admin-only history table for analysis:
+    one row per snapshot x price row.
+    Uses BASE Price ("Price") for competitiveness analytics.
+    """
+    snaps = BOOKS_BY_CODE[book_code]["list_snapshots"]()
+    if snaps is None or snaps.empty:
+        return pd.DataFrame()
+
+    snaps = snaps.copy()
+    snaps["published_at_utc_dt"] = pd.to_datetime(snaps["published_at_utc"], errors="coerce", utc=True)
+    snaps = snaps.dropna(subset=["published_at_utc_dt"]).sort_values("published_at_utc_dt", ascending=True)
+    snaps = snaps.tail(int(max_snaps))
+
+    rows = []
+    for _, s in snaps.iterrows():
+        sid = s["snapshot_id"]
+        ts = s["published_at_utc_dt"]
+
+        df = BOOKS_BY_CODE[book_code]["load_prices"](sid)
+        if df is None or df.empty:
+            continue
+
+        df = df.copy()
+
+        # Enforce BASE Price availability
+        if "Price" not in df.columns:
+            continue
+
+        df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+        df = df.dropna(subset=["Price"])
+
+        keep_cols = [c for c in ["Product", "Location", "Delivery Window", "Supplier", "Unit"] if c in df.columns]
+        df = df[keep_cols + ["Price"]].copy()
+
+        df["snapshot_id"] = sid
+        df["published_at_utc"] = ts
+
+        rows.append(df)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def _history_aggregate_for_chart(
+    hist: pd.DataFrame,
+    product: str,
+    location: str | None,
+    mode: str,
+) -> pd.DataFrame:
+    """
+    Returns a chart-ready table with:
+      published_at_utc, Series, line_price, band_min, band_max
+
+    mode:
+      - "Cheapest (any window)" -> Series="Cheapest" with band across all windows/suppliers
+      - "Cheapest per window"   -> Series=Delivery Window with band across suppliers per window
+    """
+    df = hist.copy()
+
+    if "Product" not in df.columns:
+        return pd.DataFrame()
+
+    df = df[df["Product"].astype(str) == str(product)]
+
+    if location and location != "ALL" and "Location" in df.columns:
+        df = df[df["Location"].astype(str) == str(location)]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    if "published_at_utc" not in df.columns:
+        return pd.DataFrame()
+
+    if mode == "Cheapest (any window)" or "Delivery Window" not in df.columns:
+        # Band across ALL windows + suppliers for that snapshot
+        agg = (
+            df.groupby(["published_at_utc"], dropna=False)
+              .agg(
+                  band_min=("Sell Price", "min"),
+                  band_max=("Sell Price", "max"),
+                  line_price=("Sell Price", "min"),  # cheapest as the line
+              )
+              .reset_index()
+        )
+        agg["Series"] = "Cheapest"
+        return agg[["published_at_utc", "Series", "line_price", "band_min", "band_max"]]
+
+    # Cheapest per window, band across suppliers (per snapshot, per window)
+    agg = (
+        df.groupby(["published_at_utc", "Delivery Window"], dropna=False)
+          .agg(
+              band_min=("Sell Price", "min"),
+              band_max=("Sell Price", "max"),
+              line_price=("Sell Price", "min"),
+          )
+          .reset_index()
+          .rename(columns={"Delivery Window": "Series"})
+    )
+    return agg[["published_at_utc", "Series", "line_price", "band_min", "band_max"]]
+
+
+def _apply_time_window_rolling_mean(ts: pd.DataFrame, window_days: int) -> pd.DataFrame:
+    """
+    Adds rolling_mean column using a true TIME window (e.g., 7D, 31D) per Series.
+    Works with irregular snapshot timestamps.
+    """
+    if ts is None or ts.empty:
+        return ts
+
+    out = ts.copy()
+    out = out.dropna(subset=["published_at_utc", "Series", "line_price"])
+    out = out.sort_values(["Series", "published_at_utc"])
+
+    # compute rolling mean per series using time-based window
+    res = []
+    for series, g in out.groupby("Series", dropna=False):
+        gg = g.copy().set_index("published_at_utc").sort_index()
+        gg["rolling_mean"] = gg["line_price"].rolling(f"{int(window_days)}D", min_periods=1).mean()
+        gg = gg.reset_index()
+        res.append(gg)
+
+    return pd.concat(res, ignore_index=True) if res else out
+
+
+def _render_pretty_price_chart(
+    ts: pd.DataFrame,
+    *,
+    title: str,
+    show_bands: bool,
+    show_rolling: bool,
+    window_days: int,
+):
+    if ts is None or ts.empty:
+        st.info("No history points found for that selection.")
+        return
+
+    # Add rolling mean if requested
+    if show_rolling:
+        ts = _apply_time_window_rolling_mean(ts, window_days=window_days)
+
+    # Base encodings
+    base = alt.Chart(ts).encode(
+        x=alt.X("published_at_utc:T", title="Snapshot time (UTC)")
+    )
+
+    layers = []
+
+    # Banding area (min-max)
+    if show_bands and ("band_min" in ts.columns) and ("band_max" in ts.columns):
+        band = base.mark_area(opacity=0.18).encode(
+            y=alt.Y("band_min:Q", title="Sell price (£/t)"),
+            y2="band_max:Q",
+            color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
+            tooltip=[
+                alt.Tooltip("published_at_utc:T", title="Time (UTC)"),
+                alt.Tooltip("Series:N", title="Series"),
+                alt.Tooltip("band_min:Q", title="Min (£/t)", format=",.2f"),
+                alt.Tooltip("band_max:Q", title="Max (£/t)", format=",.2f"),
+            ],
+        )
+        layers.append(band)
+
+    # Main line (cheapest)
+    line = base.mark_line(point=True).encode(
+        y=alt.Y("line_price:Q", title="Sell price (£/t)"),
+        color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
+        tooltip=[
+            alt.Tooltip("published_at_utc:T", title="Time (UTC)"),
+            alt.Tooltip("Series:N", title="Series"),
+            alt.Tooltip("line_price:Q", title="Cheapest (£/t)", format=",.2f"),
+        ],
+    )
+    layers.append(line)
+
+    # Rolling mean line
+    if show_rolling and "rolling_mean" in ts.columns:
+        ma = base.mark_line(strokeDash=[6, 4], point=False).encode(
+            y=alt.Y("rolling_mean:Q", title="Sell price (£/t)"),
+            color=alt.Color("Series:N", legend=alt.Legend(title="Series")),
+            tooltip=[
+                alt.Tooltip("published_at_utc:T", title="Time (UTC)"),
+                alt.Tooltip("Series:N", title="Series"),
+                alt.Tooltip("rolling_mean:Q", title=f"Rolling {window_days}D (£/t)", format=",.2f"),
+            ],
+        )
+        layers.append(ma)
+
+    chart = alt.layer(*layers).properties(
+        height=380,
+        title=title,
+    ).interactive()
+
+    st.altair_chart(chart, use_container_width=True)
+
+
+def page_history(role_code: str = "trader"):
+    st.subheader(f"{role_code.title()} | Price History")
+
+    # Use different keys so trader/wholesale can remember their own selection
+    key = f"{role_code}_price_history"
+    book_code = _pick_book(key, default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_history_impl(book_code=book_code, role_code=role_code)
+
+def _page_history_impl(book_code: str, role_code: str):
+    snaps = BOOKS_BY_CODE[book_code]["list_snapshots"]()
+    if snaps is None or snaps.empty:
         st.info("No snapshots yet.")
         return
+
+    # ---------------------------
+    # Price history chart
+    # ---------------------------
+    st.markdown("### Price History Analysis")
+
+    cA, cB, cC, cD, cE = st.columns([2, 2, 2, 2, 3])
+
+    with cA:
+        max_snaps = st.number_input(
+            "Lookback snapshots",
+            min_value=10,
+            max_value=500,
+            value=80,
+            step=10,
+            key=_ss_key(book_code, "hist_max_snaps"),
+        )
+
+    with cB:
+        show_bands = st.checkbox(
+            "Show min–max band",
+            value=True,
+            key=_ss_key(book_code, "hist_show_bands"),
+        )
+
+    with cC:
+        show_rolling = st.checkbox(
+            "Show rolling average",
+            value=False,
+            key=_ss_key(book_code, "hist_show_rolling"),
+        )
+
+    with cD:
+        window_days = st.number_input(
+            "Rolling window (days)",
+            min_value=1,
+            max_value=365,
+            value=31,
+            step=1,
+            key=_ss_key(book_code, "hist_window_days"),
+            disabled=(not show_rolling),
+        )
+
+    hist = _build_history_timeseries(book_code=book_code, role_code=role_code, max_snaps=int(max_snaps))
+    if hist is None or hist.empty:
+        st.info("No historical price points available yet.")
+    else:
+        products = sorted(hist["Product"].dropna().astype(str).unique().tolist()) if "Product" in hist.columns else []
+        if not products:
+            st.info("No Product values available to chart.")
+        else:
+            with cE:
+                mode = st.selectbox(
+                    "Graph rule",
+                    options=["Cheapest (any window)", "Cheapest per window"],
+                    key=_ss_key(book_code, "hist_chart_mode"),
+                    help=(
+                        "Cheapest (any window): one line = min Sell Price per snapshot across all windows/suppliers.\n"
+                        "Cheapest per window: separate lines per Delivery Window (still min across suppliers)."
+                    ),
+                )
+
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                product = st.selectbox(
+                    "Grade / Product",
+                    options=products,
+                    key=_ss_key(book_code, "hist_chart_product"),
+                )
+
+            with c2:
+                if "Location" in hist.columns:
+                    locs = ["ALL"] + sorted(
+                        hist.loc[hist["Product"].astype(str) == str(product), "Location"]
+                            .dropna().astype(str).unique().tolist()
+                    )
+                    location = st.selectbox(
+                        "Location",
+                        options=locs,
+                        key=_ss_key(book_code, "hist_chart_location"),
+                    )
+                else:
+                    location = "ALL"
+
+            ts = _history_aggregate_for_chart(
+                hist=hist,
+                product=product,
+                location=location,
+                mode=mode,
+            )
+
+            _render_pretty_price_chart(
+                ts=ts,
+                title=f"{product} | {book_code.upper()} | {mode}" + (f" | {location}" if location and location != "ALL" else ""),
+                show_bands=bool(show_bands),
+                show_rolling=bool(show_rolling),
+                window_days=int(window_days),
+            )
+
+    st.divider()
+
+    # ---------------------------
+    # Snapshot table (SELL ONLY for traders)
+    # ---------------------------
+    st.markdown("### Snapshot history table")
 
     snaps = snaps.copy()
     snaps["label"] = snaps["published_at_utc"] + " | " + snaps["published_by"] + " | " + snaps["snapshot_id"].str[:8]
@@ -1365,33 +1952,76 @@ def _page_history_impl(book_code: str):
     sid = snaps.loc[snaps["label"] == label, "snapshot_id"].iloc[0]
 
     df = BOOKS_BY_CODE[book_code]["load_prices"](sid)
+    if df is None or df.empty:
+        st.info("Snapshot is empty.")
+        return
 
-    # Snapshot already contains Sell Price in DB; show both Base and Sell
-    # (No runtime margin application)
+    # enforce Sell Price column exists
+    df = df.copy()
+    df = _apply_role_margins(df, role_code=role_code)
+    if "Sell Price" not in df.columns:
+        if "Price" in df.columns:
+            df["Sell Price"] = df["Price"]
+        else:
+            st.error("Snapshot has no Sell Price (and no Price fallback).")
+            return
+
+    # HARD RULE: traders never see base Price and can't even search it
+    is_admin = (st.session_state.get("role") == "admin")
+
+    base_cols = [c for c in ["Product Category", "Product", "Location", "Delivery Window", "Supplier", "Unit"] if c in df.columns]
+    show_cols = base_cols + ["Sell Price"]
+
+    if is_admin:
+        show_base = st.checkbox(
+            "Admin: show base Price column",
+            value=False,
+            key=_ss_key(book_code, "hist_admin_show_base"),
+        )
+        if show_base and "Price" in df.columns:
+            show_cols = base_cols + ["Price", "Sell Price"]
+
+    view = df[show_cols].copy()
 
     q = st.text_input("Search", key=_ss_key(book_code, "hist_search"))
     if q:
         ql = q.lower()
-        df = df[df.apply(lambda r: any(ql in str(v).lower() for v in r.values), axis=1)]
+        view = view[view.apply(lambda r: any(ql in str(v).lower() for v in r.values), axis=1)]
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sell Price": st.column_config.NumberColumn("Sell Price (£/t)", format="£%.2f"),
+            "Price": st.column_config.NumberColumn("Base Price (£/t)", format="£%.2f"),
+        },
+    )
 
 def page_trader_best_prices():
     st.subheader("Trader | FULL LOAD PRICES")
 
-    tab_f, tab_s = st.tabs(["Fertiliser", "Seed"])
-    with tab_f:
-        _page_trader_best_prices_impl(book_code="fert")
-    with tab_s:
-        _page_trader_best_prices_impl(book_code="seed")
+    book_code = _pick_book("trader_full_load", default="fert")
+    st.session_state["presence_context"] = book_code
 
-def _page_trader_best_prices_impl(book_code: str):
+    _page_best_prices_impl(book_code=book_code, role_code="trader")
+
+def _page_best_prices_impl(book_code: str, role_code: str):
     sid, df = _get_latest_prices_df_for(book_code)
-    if df is None:
+    if df is None or df.empty:
         st.warning("No supplier snapshot available. Admin must publish one.")
         return
+    
+    df = _apply_role_margins(df, role_code=role_code)
+    
+    _inject_offer_css()
+    df_off = _apply_offers_to_prices_df(book_code, df)
 
-    board = _best_prices_board(df)
+    # build board off the offer-adjusted sell price
+    tmp = df_off.copy()
+    tmp["Sell Price"] = tmp["Effective Sell Price"]
+
+    board = _best_prices_board(tmp)
 
     st.markdown("### Filters")
     f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
@@ -1490,45 +2120,337 @@ def _page_trader_best_prices_impl(book_code: str):
             hide_index=True,
             column_config={"Best Price": st.column_config.NumberColumn("Best Price", format="£%.2f")},
         )
+
+def page_todays_offers(role_code: str = "trader"):
+    st.subheader("Today's Offers")
+    _inject_offer_css()
+
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=10_000, key=f"offers_autorefresh_{role_code}")
+    except Exception:
+        pass
+
+    book_code = _pick_book(f"{role_code}_offers", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_todays_offers_impl(book_code, role_code=role_code)
+
+
+def _page_todays_offers_impl(book_code: str, role_code: str):
+    sid, df = _get_latest_prices_df_for(book_code)
+    if df is None or df.empty:
+        st.warning("No snapshot available.")
+        return
+
+    df = _apply_role_margins(df, role_code=role_code)
+
+    df_off = _apply_offers_to_prices_df(book_code, df)
+    live = df_off[df_off["Offer Active"] == True].copy()
+
+    if live.empty:
+        st.info("No live offers right now.")
+    else:
+        now = datetime.now(timezone.utc)
+
+        def _remain(iso):
+            try:
+                end = datetime.fromisoformat(str(iso))
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+        
+                sec = int((end - now).total_seconds())
+                if sec <= 0:
+                    return "expired"
+                h = sec // 3600
+                m = (sec % 3600) // 60
+                return f"{h}h {m}m"
+            except Exception:
+                return ""
+
+        live["Ends in"] = live["Offer Ends"].apply(_remain)
+        live["Was £/t"] = pd.to_numeric(live["Sell Price"], errors="coerce").fillna(0.0)
+        live["Now £/t"] = pd.to_numeric(live["Effective Sell Price"], errors="coerce").fillna(0.0)
+        live["Save £/t"] = live["Was £/t"] - live["Now £/t"]
+
+        show = live[[
+            "Product", "Location", "Delivery Window", "Supplier",
+            "Offer Title", "Was £/t", "Now £/t", "Save £/t", "Ends in"
+        ]].copy()
+
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=1000, key=_ss_key(book_code, "quote_blink_refresh"))
+        except Exception:
+            pass
+
+        blink_on = (int(time.time()) % 2) == 0
+
+        # Force currency formatting to 2dp
+        sty = show.style.format({
+            "Was £/t": "£{:.2f}",
+            "Now £/t": "£{:.2f}",
+            "Save £/t": "£{:.2f}",
+        })
+        
+        # Keep your blinking emphasis
+        if blink_on:
+            sty = sty.set_properties(
+                subset=["Now £/t", "Save £/t", "Ends in"],
+                **{"color": "#d11", "font-weight": "700"}
+            )
+        else:
+            sty = sty.set_properties(
+                subset=["Now £/t", "Save £/t", "Ends in"],
+                **{"color": "#d11", "font-weight": "700", "opacity": "0.60"}
+            )
+        
+        st.dataframe(sty, use_container_width=True, hide_index=True)
+
+    # ---------------------------
+    # Daily market comment (per book)
+    # ---------------------------
+    settings = get_settings()
+    comment_key = f"daily_market_comment_{book_code}"
+    current_comment = (settings.get(comment_key, "") or "").strip()
+
+    st.markdown("### Daily market comment")
+
+    # Everyone can read it
+    if current_comment:
+        st.markdown(current_comment)
+    else:
+        st.caption("No market comment published yet.")
+
+    # Only admins can edit + save
+    if st.session_state.get("role") == "admin":
+        new_comment = st.text_area(
+            "Admin edit (visible to all users)",
+            value=current_comment,
+            height=120,
+            key=_ss_key(book_code, "daily_comment_editor"),
+        )
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            if st.button("Save market comment", type="primary", use_container_width=True, key=_ss_key(book_code, "btn_save_daily_comment")):
+                set_setting(comment_key, new_comment.strip())
+                st.success("Market comment saved.")
+                st.rerun()
+        with c2:
+            st.caption("Saved per book (fert/seed) and shown directly under today’s offers.")
+
+    # Admin controls (simple MVP)
+    if st.session_state.get("role") == "admin":
+        st.divider()
+        st.markdown("### Admin: Create offer")
+
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+        with c1:
+            product = st.selectbox("Product", sorted(df["Product"].dropna().unique().tolist()), key=_ss_key(book_code, "offer_prod"))
+        with c2:
+            locs = sorted(df.loc[df["Product"] == product, "Location"].dropna().unique().tolist())
+            location = st.selectbox("Location", locs, key=_ss_key(book_code, "offer_loc"))
+        with c3:
+            wins = sorted(df.loc[(df["Product"] == product) & (df["Location"] == location), "Delivery Window"].dropna().unique().tolist())
+            window = st.selectbox("Delivery Window", wins, key=_ss_key(book_code, "offer_win"))
+        with c4:
+            sups = sorted(df.loc[
+                (df["Product"] == product) &
+                (df["Location"] == location) &
+                (df["Delivery Window"] == window),
+                "Supplier"
+            ].dropna().unique().tolist())
+            supplier = st.selectbox("Supplier (optional)", ["(Any)"] + sups, key=_ss_key(book_code, "offer_sup"))
+
+        c5, c6, c7 = st.columns([2, 2, 4])
+        with c5:
+            mode = st.selectbox("Mode", ["delta", "fixed"], key=_ss_key(book_code, "offer_mode"))
+        with c6:
+            value = st.number_input("Value (£/t)", min_value=0.0, value=5.0, step=0.5, key=_ss_key(book_code, "offer_val"))
+        with c7:
+            title = st.text_input("Title", value="Today's offer", key=_ss_key(book_code, "offer_title"))
+
+        hours = st.number_input("Expires in (hours)", min_value=1, value=12, step=1, key=_ss_key(book_code, "offer_hours"))
+
+        if st.button("Create offer", type="primary", use_container_width=True, key=_ss_key(book_code, "offer_create_btn")):
+            now_utc = datetime.utcnow()  # naive UTC, matches db utc_now_iso format
+            start = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+            end = (now_utc + timedelta(hours=int(hours))).strftime("%Y-%m-%d %H:%M:%S")
+
+            create_offer(
+                book_code=book_code,
+                product=product,
+                location=location,
+                delivery_window=window,
+                supplier=None if supplier == "(Any)" else supplier,
+                mode=mode,
+                value=float(value),
+                title=title,
+                starts_at_utc=start,
+                ends_at_utc=end,
+                created_by=st.session_state.get("user", "unknown")
+            )
+            st.success("Offer created.")
+            st.rerun()
+
+        st.divider()
+        st.markdown("### Admin: Manage offers")
+        all_off = list_offers(book_code=book_code, active_only=True)
+        if all_off is None or all_off.empty:
+            st.info("No offers created yet.")
+        else:
+            st.dataframe(all_off, use_container_width=True, hide_index=True)
+            # pick an offer_id safely
+            ids = all_off["offer_id"].astype(int).tolist() if "offer_id" in all_off.columns else []
+            if ids:
+                off_id = st.selectbox("Select offer_id to deactivate", ids, key=_ss_key(book_code, "offer_deact_id"))
+                if st.button("Deactivate", use_container_width=True, key=_ss_key(book_code, "offer_deact_btn")):
+                    deactivate_offer(int(off_id))
+                    st.success(f"Offer {int(off_id)} deactivated.")
+                    st.rerun()
+            else:
+                st.info("No offer_id column found in offers table.")
+
+def page_wholesale_pricing():
+    st.subheader("Wholesale | Pricing")
+
+    book_code = _pick_book("wholesale_pricing", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_pricing_impl(book_code=book_code, role_code="wholesaler")
+
+
+def page_wholesale_best_prices():
+    st.subheader("Wholesale | FULL LOAD PRICES")
+
+    book_code = _pick_book("wholesale_full_load", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_best_prices_impl(book_code=book_code, role_code="wholesaler")
+
+
+def page_wholesale_orders():
+    # Do NOT call page_trader_orders() because it hardcodes the Trader header
+    st.subheader("Wholesale | Orders")
+
+    df = list_orders_for_user(user=st.session_state.get("user", "unknown"))
+    if df.empty:
+        st.info("No orders yet.")
+        return
+
+    status = st.selectbox(
+        "Filter status",
+        ["ALL", "PENDING", "COUNTERED", "CONFIRMED", "FILLED", "REJECTED", "CANCELLED"],
+        key="wh_orders_status"
+    )
+    work = df.copy()
+    if status != "ALL":
+        work = work[work["status"] == status]
+
+    work["label"] = work["created_at_utc"] + " | " + work["status"] + " | " + work["order_id"].str[:8]
+    sel = st.selectbox("Select order", work["label"].tolist(), key="wh_orders_sel")
+
+    order_id = work.loc[work["label"] == sel, "order_id"].iloc[0]
+    header = get_order_header(order_id)
+    lines = get_order_lines(order_id)
+    actions = get_order_actions(order_id)
+
+    st.markdown("### Order summary")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Order", header["order_id"][:8])
+    c2.metric("Status", header["status"])
+    c3.metric("Snapshot", header["supplier_snapshot_id"][:8] if header.get("supplier_snapshot_id") else "")
+    c4.metric("Created (UTC)", str(header["created_at_utc"])[:19])
+
+    if header.get("trader_note"):
+        st.caption(f"Trader note: {header['trader_note']}")
+    if header.get("admin_note"):
+        st.caption(f"Admin note: {header['admin_note']}")
+
+    st.markdown("### Lines")
+    st.dataframe(lines, use_container_width=True, hide_index=True)
+
+    sell_total = float((lines["Sell Price"] * lines["Qty"]).sum())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sell value", f"£{sell_total:,.2f}")
+    c2.metric("Lines", int(len(lines)))
+    c3.metric("Total tonnes", f"{float(lines['Qty'].sum()):,.2f} t")
+
+    st.markdown("### Timeline")
+    st.dataframe(actions[["action_type", "action_at_utc", "action_by"]], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    if header["status"] in ("PENDING", "COUNTERED"):
+        if st.button("Cancel order", use_container_width=True, key="wh_orders_cancel"):
+            try:
+                trader_cancel_order(order_id, user=st.session_state.get("user", "unknown"), expected_version=header["version"])
+                st.success("Order cancelled.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    if header["status"] == "COUNTERED":
+        if st.button("Accept counter", type="primary", use_container_width=True, key="wh_orders_accept"):
+            try:
+                trader_accept_counter(order_id, user=st.session_state.get("user", "unknown"), expected_version=header["version"])
+                st.success("Counter accepted. Order is now CONFIRMED.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+def page_wholesale_offers():
+    st.subheader("Wholesale | Offers")
+    _inject_offer_css()
+
+    book_code = _pick_book("wholesale_offers", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_todays_offers_impl(book_code, role_code="wholesaler")
+
 # ---------------------------
 # Presence (sidebar widget)
 # ---------------------------
 
-def _ensure_session_id():
-    if "presence_session_id" not in st.session_state:
-        st.session_state.presence_session_id = str(uuid.uuid4())
-
 
 def _utc_parse(ts: str) -> datetime:
-    # Supports "2026-01-14T15:12:34+00:00"
-    return datetime.fromisoformat(ts)
+    """
+    Parse timestamps that may be stored as:
+      - "YYYY-MM-DD HH:MM:SS" (naive)
+      - "YYYY-MM-DDTHH:MM:SS+00:00" (aware)
+    Always return an aware UTC datetime.
+    """
+    if ts is None:
+        return datetime.now(timezone.utc)
+
+    s = str(ts).strip()
+    if not s:
+        return datetime.now(timezone.utc)
+
+    dt = datetime.fromisoformat(s)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt
 
 
 def render_presence_panel(current_page_name: str, *, refresh_ms: int = 10_000):
     """
     Sidebar presence panel only:
-    - heartbeats current user
     - shows online users
     - toasts when users come/go (diff vs last refresh)
-    """
-    _ensure_session_id()
 
+    NOTE: heartbeat is handled centrally in app.py to avoid double writes.
+    """
     user = st.session_state.get("user", "") or ""
     role = st.session_state.get("role", "") or ""
-    session_id = st.session_state.presence_session_id
-
-    # Heartbeat every run
-    presence_heartbeat(
-        user=user,
-        role=role,
-        page=current_page_name,
-        session_id=session_id
-    )
 
     # Optional auto-refresh (install streamlit-autorefresh for true "live" feel)
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=refresh_ms, key="presence_autorefresh")
+        st_autorefresh(interval=refresh_ms, key=f"presence_autorefresh_{current_page_name}")
     except Exception:
         pass
 
@@ -1544,7 +2466,7 @@ def render_presence_panel(current_page_name: str, *, refresh_ms: int = 10_000):
         for u in sorted(prev - now):
             st.toast(f"{u} went offline")
 
-    st.session_state.presence_prev_online = list(now)
+    st.session_state["presence_prev_online"] = list(now)
 
     st.markdown("### Online now")
 
@@ -1561,6 +2483,7 @@ def render_presence_panel(current_page_name: str, *, refresh_ms: int = 10_000):
         rows.append({
             "User": r.get("user", ""),
             "Role": r.get("role", "") or "",
+            "Context": r.get("context", "") or "",
             "Page": r.get("page", "") or "",
             "Last seen": f"{sec_ago}s ago",
         })
@@ -1574,10 +2497,384 @@ def render_presence_panel(current_page_name: str, *, refresh_ms: int = 10_000):
         column_config={
             "User": st.column_config.TextColumn("User"),
             "Role": st.column_config.TextColumn("Role"),
+            "Context": st.column_config.TextColumn("Context"),
             "Page": st.column_config.TextColumn("Page"),
             "Last seen": st.column_config.TextColumn("Last seen"),
-        },
+        }
     )
+
+def page_admin_supplier_analysis():
+    if st.session_state.get("role") != "admin":
+        st.warning("Admin access required.")
+        return
+
+    st.subheader("Admin | Supplier Analysis")
+
+    book_code = _pick_book("admin_supplier_analysis", default="fert")
+    st.session_state["presence_context"] = book_code
+
+    _page_admin_supplier_analysis_impl(book_code=book_code)
+
+
+def _page_admin_supplier_analysis_impl(book_code: str):
+    st.markdown("### Supplier Analysis")
+
+    c1, c2 = st.columns([2, 2])
+    with c1:
+        max_snaps = st.number_input(
+            "Lookback snapshots",
+            min_value=10, max_value=500, value=180, step=10,
+            key=_ss_key(book_code, "supana_max_snaps"),
+        )
+    with c2:
+        min_obs = st.number_input(
+            "Min observations per supplier",
+            min_value=1, max_value=9999, value=25, step=1,
+            key=_ss_key(book_code, "supana_min_obs"),
+        )
+
+    hist = _build_history_timeseries_admin_base(book_code=book_code, max_snaps=int(max_snaps))
+    if hist is None or hist.empty:
+        st.info("No historical price points available yet.")
+        return
+
+    # Dropdown filters (built from available history)
+    prod_opts = ["(All)"] + sorted(hist["Product"].dropna().astype(str).unique().tolist()) if "Product" in hist.columns else ["(All)"]
+    loc_opts = ["(All)"]
+    if "Location" in hist.columns:
+        loc_opts += sorted(hist["Location"].dropna().astype(str).unique().tolist())
+    
+    c3, c4 = st.columns([3, 3])
+    with c3:
+        product = st.selectbox(
+            "Product (optional)",
+            options=prod_opts,
+            index=0,
+            key=_ss_key(book_code, "supana_product_filter"),
+        )
+    with c4:
+        location = st.selectbox(
+            "Location (optional)",
+            options=loc_opts,
+            index=0,
+            key=_ss_key(book_code, "supana_location_filter"),
+        )
+    
+    product = "" if product == "(All)" else str(product).strip()
+    location = "" if location == "(All)" else str(location).strip()
+
+    # Required columns
+    required = ["published_at_utc", "Supplier", "Product", "Price"]
+    missing = [c for c in required if c not in hist.columns]
+    if missing:
+        st.error("Missing required columns: " + ", ".join(missing))
+        return
+
+    df = hist.copy()
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df = df.dropna(subset=["Price", "published_at_utc"])
+
+    if product.strip():
+        df = df[df["Product"].astype(str) == product.strip()]
+    if location.strip() and "Location" in df.columns:
+        df = df[df["Location"].astype(str) == location.strip()]
+
+    if df.empty:
+        st.info("No rows match your filter.")
+        return
+
+    # Best price per snapshot (within current filters)
+    best = (
+        df.groupby("published_at_utc", dropna=False)["Price"]
+          .min()
+          .rename("best_price")
+          .reset_index()
+    )
+
+    df = df.merge(best, on="published_at_utc", how="left")
+    df["premium_to_best"] = df["Price"] - df["best_price"]
+    df["is_cheapest"] = df["premium_to_best"] <= 1e-9
+
+    sup = (
+        df.groupby("Supplier", dropna=False)
+          .agg(
+              obs=("Price", "count"),
+              cheapest_wins=("is_cheapest", "sum"),
+              avg_sell=("Price", "mean"),
+              med_sell=("Price", "median"),
+              avg_premium=("premium_to_best", "mean"),
+              med_premium=("premium_to_best", "median"),
+              p90_premium=("premium_to_best", lambda x: x.quantile(0.90) if len(x) else 0.0),
+              vol_std=("Price", "std"),
+          )
+          .reset_index()
+    )
+    sup["vol_std"] = sup["vol_std"].fillna(0.0)
+    sup = sup[sup["obs"] >= int(min_obs)].copy()
+    if sup.empty:
+        st.info("No suppliers meet the minimum observation threshold.")
+        return
+
+    sup["cheapest_share_pct"] = (sup["cheapest_wins"] / sup["obs"]) * 100.0
+    sup = sup.sort_values(["cheapest_share_pct", "avg_premium"], ascending=[False, True])
+
+    # KPI
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Suppliers", int(len(sup)))
+    k2.metric("Top supplier", str(sup.iloc[0]["Supplier"]))
+    k3.metric("Cheapest share", f"{float(sup.iloc[0]['cheapest_share_pct']):.2f}%")
+    k4.metric("Avg premium", f"£{float(sup.iloc[0]['avg_premium']):.2f}/t")
+    k5.metric("Obs (top)", int(sup.iloc[0]["obs"]))
+
+    st.divider()
+
+    st.markdown("### Supplier Leaderboard")
+    st.dataframe(
+        sup[["Supplier","obs","cheapest_share_pct","avg_premium","med_premium","p90_premium","avg_sell","med_sell","vol_std"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "cheapest_share_pct": st.column_config.NumberColumn("Cheapest share (%)", format="%.2f"),
+            "avg_premium": st.column_config.NumberColumn("Avg premium (£/t)", format="£%.2f"),
+            "med_premium": st.column_config.NumberColumn("Median premium (£/t)", format="£%.2f"),
+            "p90_premium": st.column_config.NumberColumn("P90 premium (£/t)", format="£%.2f"),
+            "avg_sell": st.column_config.NumberColumn("Avg base (£/t)", format="£%.2f"),
+            "med_sell": st.column_config.NumberColumn("Median base (£/t)", format="£%.2f"),
+            "vol_std": st.column_config.NumberColumn("Volatility (std £/t)", format="£%.2f"),
+        }
+    )
+
+    st.divider()
+
+    st.markdown("### Trend: Premium to best over time")
+    top_n = st.slider("Top N suppliers to plot", 3, 15, 8, key=_ss_key(book_code, "supana_topn"))
+    top_suppliers = sup["Supplier"].head(int(top_n)).astype(str).tolist()
+
+    chart_df = df[df["Supplier"].astype(str).isin(top_suppliers)].copy()
+    chart_df = (
+        chart_df.groupby(["published_at_utc", "Supplier"], dropna=False)
+                .agg(premium=("premium_to_best", "min"))
+                .reset_index()
+                .sort_values(["Supplier","published_at_utc"])
+    )
+
+    roll_days = st.number_input("Rolling mean window (days)", 1, 365, 31, 1, key=_ss_key(book_code, "supana_roll"))
+    out = []
+    for sname, g in chart_df.groupby("Supplier", dropna=False):
+        gg = g.set_index("published_at_utc").sort_index()
+        gg["roll"] = gg["premium"].rolling(f"{int(roll_days)}D", min_periods=1).mean()
+        gg = gg.reset_index()
+        gg["Supplier"] = sname
+        out.append(gg)
+    chart_df = pd.concat(out, ignore_index=True) if out else chart_df
+
+    base = alt.Chart(chart_df).encode(
+        x=alt.X("published_at_utc:T", title="Snapshot time (UTC)"),
+        color=alt.Color("Supplier:N", legend=alt.Legend(title="Supplier"))
+    )
+
+    line = base.mark_line(point=True).encode(
+        y=alt.Y("premium:Q", title="Premium to best (£/t)"),
+        tooltip=[
+            alt.Tooltip("published_at_utc:T", title="Time (UTC)"),
+            alt.Tooltip("Supplier:N", title="Supplier"),
+            alt.Tooltip("premium:Q", title="Premium (£/t)", format=",.2f"),
+        ]
+    )
+
+    roll = base.mark_line(strokeDash=[6,4]).encode(
+        y=alt.Y("roll:Q", title="Premium to best (£/t)"),
+        tooltip=[
+            alt.Tooltip("roll:Q", title=f"Rolling {int(roll_days)}D", format=",.2f"),
+        ]
+    )
+
+    st.altair_chart(
+        alt.layer(line, roll).properties(height=360).interactive(),
+        use_container_width=True
+    )
+
+    with st.expander("Drilldown table", expanded=False):
+        drill = df[["published_at_utc","Supplier","Product","Price","best_price","premium_to_best"]].copy()
+        drill = drill.sort_values(["published_at_utc","premium_to_best"], ascending=[False, True])
+        st.dataframe(
+            drill,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Price": st.column_config.NumberColumn("Sell (£/t)", format="£%.2f"),
+                "best_price": st.column_config.NumberColumn("Best (£/t)", format="£%.2f"),
+                "premium_to_best": st.column_config.NumberColumn("Premium (£/t)", format="£%.2f"),
+            }
+        )
+
+def page_admin_user_data():
+    if st.session_state.get("role") != "admin":
+        st.warning("Admin access required.")
+        return
+
+    st.subheader("Admin | User Data")
+    st.caption("DEBUG: Admin | User Data v2 loaded")
+
+
+    # -------------------------
+    # Controls
+    # -------------------------
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    with c1:
+        lookback_days = st.number_input("Lookback (days)", min_value=1, max_value=365, value=30, step=1, key="ud_lookback")
+    with c2:
+        # user filter
+        users = ["(All)"] + (list_distinct_presence_users(days=int(lookback_days)) or [])
+        sel_user = st.selectbox("User", users, index=0, key="ud_user")
+        user_filter = None if sel_user == "(All)" else sel_user
+    with c3:
+        # page filter
+        pages = ["(All)"] + (list_distinct_presence_pages(days=int(lookback_days)) or [])
+        sel_page = st.selectbox("Page", pages, index=0, key="ud_page")
+        page_filter = None if sel_page == "(All)" else sel_page
+
+    with c4:
+        ctx_label = st.selectbox(
+            "Book",
+            ["(All)", "Fertiliser", "Seed"],
+            index=0,
+            key="ud_ctx",
+        )
+        if ctx_label == "(All)":
+            ctx_filter = None
+        elif ctx_label == "Fertiliser":
+            ctx_filter = "fert"
+        else:  # "Seed"
+            ctx_filter = "seed"
+
+    # Build UTC range
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=int(lookback_days))
+    start_utc = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    end_utc = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # -------------------------
+    # Pull data
+    # -------------------------
+    # Daily logins (sessions/day based on first event per session)
+    logins = presence_daily_logins(start_utc=start_utc, end_utc=end_utc, user=user_filter, context=ctx_filter)
+    transitions = presence_daily_page_transitions(start_utc=start_utc, end_utc=end_utc, user=user_filter, context=ctx_filter)
+    sessions = presence_session_summary(start_utc=start_utc, end_utc=end_utc, user=user_filter, context=ctx_filter)
+    
+    events = list_presence_events(
+        user=user_filter,
+        page=page_filter,
+        context=ctx_filter,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        limit=20000,
+    )
+
+    # -------------------------
+    # Top KPIs
+    # -------------------------
+    # Unique users (from events in-window, respects filters)
+    unique_users = int(events["user"].nunique()) if (events is not None and not events.empty and "user" in events.columns) else 0
+    total_events = int(len(events)) if (events is not None and not events.empty) else 0
+    total_sessions = int(len(sessions)) if (sessions is not None and not sessions.empty) else 0
+
+    total_navs = 0
+    if transitions is not None and not transitions.empty and "navigations" in transitions.columns:
+        total_navs = int(pd.to_numeric(transitions["navigations"], errors="coerce").fillna(0).sum())
+
+    avg_dur = 0
+    if sessions is not None and not sessions.empty and "duration_seconds" in sessions.columns:
+        avg_dur = int(pd.to_numeric(sessions["duration_seconds"], errors="coerce").fillna(0).mean())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Unique users", unique_users)
+    k2.metric("Sessions", total_sessions)
+    k3.metric("Page transitions", total_navs)
+    k4.metric("Avg session (mins)", round(avg_dur / 60.0, 1) if avg_dur else 0)
+
+    st.divider()
+
+    # -------------------------
+    # Charts
+    # -------------------------
+    # Chart 1: sessions (logins) per day
+    if logins is not None and not logins.empty:
+        dfc = logins.copy()
+        dfc["day"] = pd.to_datetime(dfc["day"])
+        dfc["logins"] = pd.to_numeric(dfc["logins"], errors="coerce").fillna(0)
+
+        ch = alt.Chart(dfc).mark_line(point=True).encode(
+            x=alt.X("day:T", title="Day"),
+            y=alt.Y("logins:Q", title="Sessions (logins)"),
+            tooltip=[alt.Tooltip("day:T", title="Day"), alt.Tooltip("logins:Q", title="Sessions")]
+        ).properties(height=260).interactive()
+
+        st.markdown("### Sessions per day")
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.info("No login/session data in this window.")
+
+    # Chart 2: top pages by transitions (optionally respecting user filter)
+    if transitions is not None and not transitions.empty:
+        top = transitions.copy()
+        top["navigations"] = pd.to_numeric(top["navigations"], errors="coerce").fillna(0)
+        if page_filter:
+            top = top[top["page"] == page_filter]
+
+        # Aggregate across days for the bar chart
+        agg = top.groupby("page", as_index=False)["navigations"].sum().sort_values("navigations", ascending=False).head(20)
+
+        if not agg.empty:
+            bar = alt.Chart(agg).mark_bar().encode(
+                x=alt.X("navigations:Q", title="Transitions"),
+                y=alt.Y("page:N", sort="-x", title="Page"),
+                tooltip=[alt.Tooltip("page:N", title="Page"), alt.Tooltip("navigations:Q", title="Transitions")]
+            ).properties(height=420)
+
+            st.markdown("### Top pages by navigation events")
+            st.altair_chart(bar, use_container_width=True)
+
+        # Optional: day-by-day heat style table (simple)
+        with st.expander("Transitions (day x page)", expanded=False):
+            td = top.copy()
+            td["day"] = pd.to_datetime(td["day"])
+            st.dataframe(td.sort_values(["day", "navigations"], ascending=[False, False]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No page transition data in this window.")
+
+    st.divider()
+
+    # -------------------------
+    # Drilldowns
+    # -------------------------
+    st.markdown("### Session summary")
+    if sessions is None or sessions.empty:
+        st.caption("No sessions in this window.")
+    else:
+        s = sessions.copy()
+        # light formatting
+        for col in ["duration_seconds", "distinct_pages", "transitions"]:
+            if col in s.columns:
+                s[col] = pd.to_numeric(s[col], errors="coerce").fillna(0).astype(int)
+
+        st.dataframe(
+            s,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "duration_seconds": st.column_config.NumberColumn("Duration (s)"),
+                "distinct_pages": st.column_config.NumberColumn("Distinct pages"),
+                "transitions": st.column_config.NumberColumn("Transitions"),
+            }
+        )
+
+    st.markdown("### Raw events")
+    if events is None or events.empty:
+        st.caption("No events in this window (or filters exclude everything).")
+    else:
+        e = events.copy()
+        st.dataframe(e, use_container_width=True, hide_index=True)
 
 def page_admin_blotter():
     # --- Guard ---
@@ -1746,4 +3043,3 @@ def page_admin_blotter():
 
     st.markdown("### Detail")
     st.dataframe(view, use_container_width=True, hide_index=True)
-
