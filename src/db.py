@@ -16,7 +16,8 @@ def conn():
 
 
 def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # SQLite-friendly UTC timestamp
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def _ensure_column(cur, table_name: str, col_name: str, col_ddl: str):
     """
@@ -130,14 +131,15 @@ def init_db():
     # --- Admin margins ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS price_margins (
-        margin_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        scope_type TEXT NOT NULL CHECK (scope_type IN ('category','product')),
-        scope_value TEXT NOT NULL,
-        margin_per_t REAL NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1,
-        created_at_utc TEXT NOT NULL,
-        created_by TEXT NOT NULL
-    );
+          margin_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          role_code TEXT NOT NULL DEFAULT 'trader',
+          scope_type TEXT NOT NULL,
+          scope_value TEXT NOT NULL,
+          margin_per_t REAL NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at_utc TEXT NOT NULL,
+          created_by TEXT NOT NULL
+        );
     """)
 
     # --- Fertiliser delivery/collection options (Fert-only add-ons) ---
@@ -151,6 +153,12 @@ def init_db():
         created_by TEXT NOT NULL
     );
     """)
+
+    # ---- MIGRATION: add role_code to price_margins if missing ----
+    try:
+        cur.execute("ALTER TABLE price_margins ADD COLUMN role_code TEXT NOT NULL DEFAULT 'trader';")
+    except Exception:
+        pass
 
     # Defaults if empty
     cur.execute("SELECT COUNT(*) FROM fert_delivery_options;")
@@ -166,77 +174,35 @@ def init_db():
             ("Collected bulk", -15.0, now, "system"),
         ])
 
-    # --- Stock stores (pseudo-supplier STOCK) ---
+    # --- Today's Offers (time-bounded price overrides) ---
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS stock_stores (
-        store_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        postcode TEXT NOT NULL,
-        lat REAL,
-        lon REAL,
+    CREATE TABLE IF NOT EXISTS todays_offers (
+        offer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        book_code TEXT NOT NULL CHECK (book_code IN ('fert','seed')),
+        product TEXT NOT NULL,
+        location TEXT NOT NULL,
+        delivery_window TEXT NOT NULL,
+        supplier TEXT,
+        mode TEXT NOT NULL CHECK (mode IN ('delta','fixed')),
+        value REAL NOT NULL,
+        title TEXT,
         active INTEGER NOT NULL DEFAULT 1,
+        starts_at_utc TEXT NOT NULL,
+        ends_at_utc TEXT NOT NULL,
         created_at_utc TEXT NOT NULL,
         created_by TEXT NOT NULL
     );
     """)
 
     cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_stock_stores_active
-    ON stock_stores (active);
+    CREATE INDEX IF NOT EXISTS idx_todays_offers_active_time
+    ON todays_offers (book_code, active, starts_at_utc, ends_at_utc);
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS stock_store_products (
-        store_id TEXT NOT NULL,
-        product TEXT NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1,
-        qty_t REAL,
-        updated_at_utc TEXT NOT NULL,
-        updated_by TEXT NOT NULL,
-        PRIMARY KEY (store_id, product),
-        FOREIGN KEY (store_id) REFERENCES stock_stores(store_id)
-    );
+    CREATE INDEX IF NOT EXISTS idx_todays_offers_lookup
+    ON todays_offers (book_code, product, location, delivery_window, supplier);
     """)
-
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_stock_store_products_product
-    ON stock_store_products (product, active);
-    """)
-
-    # --- Haulage tariff for stock (two-tier: bands up to break, then per-mile) ---
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS haulage_settings (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        break_miles REAL NOT NULL,
-        per_mile_per_t REAL NOT NULL,
-        updated_at_utc TEXT NOT NULL,
-        updated_by TEXT NOT NULL
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS haulage_bands (
-        band_id TEXT PRIMARY KEY,
-        min_miles REAL NOT NULL,
-        max_miles REAL NOT NULL,
-        charge_per_t REAL NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1,
-        sort_order INTEGER NOT NULL DEFAULT 0
-    );
-    """)
-
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_haulage_bands_active
-    ON haulage_bands (active, sort_order);
-    """)
-
-    # Seed defaults if empty
-    cur.execute("SELECT COUNT(*) FROM haulage_settings;")
-    if cur.fetchone()[0] == 0:
-        cur.execute("""
-            INSERT INTO haulage_settings (id, break_miles, per_mile_per_t, updated_at_utc, updated_by)
-            VALUES (1, 100.0, 0.10, ?, ?)
-        """, (utc_now_iso(), "system"))
 
     # --- Presence (who is online) ---
     cur.execute("""
@@ -245,6 +211,7 @@ def init_db():
         session_id TEXT NOT NULL,
         role TEXT,
         page TEXT,
+        context TEXT DEFAULT '',
         online_since_utc TEXT NOT NULL,
         last_seen_utc TEXT NOT NULL,
         PRIMARY KEY (user, session_id)
@@ -256,6 +223,43 @@ def init_db():
     ON user_presence (last_seen_utc);
     """)
 
+    # --- Presence events (history / analytics) ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS presence_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_at_utc TEXT NOT NULL,
+        user TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        role TEXT,
+        page TEXT,
+        context TEXT DEFAULT ''
+    );
+    """)
+
+     # ✅ MIGRATION SAFETY: if table already existed from older schema, ensure required columns exist
+    _ensure_column(cur, "presence_events", "role", "role TEXT")
+    _ensure_column(cur, "presence_events", "page", "page TEXT")
+    _ensure_column(cur, "presence_events", "context", "context TEXT DEFAULT ''")
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_presence_events_user_time
+    ON presence_events (user, event_at_utc);
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_presence_events_session_time
+    ON presence_events (session_id, event_at_utc);
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_presence_events_page_time
+    ON presence_events (page, event_at_utc);
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_presence_events_context_time
+    ON presence_events (context, event_at_utc);
+    """)
 
     # --- App settings ---
     cur.execute("""
@@ -358,6 +362,17 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at_utc);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_order ON order_actions(order_id, action_at_utc);")
 
+    # --- Schema migration: add context column (safe if already exists) ---
+    try:
+        cur.execute("ALTER TABLE presence_events ADD COLUMN context TEXT DEFAULT ''")
+    except Exception:
+        pass
+    
+    try:
+        cur.execute("ALTER TABLE user_presence ADD COLUMN context TEXT DEFAULT ''")
+    except Exception:
+        pass
+
     c.commit()
     c.close()
 
@@ -432,243 +447,6 @@ def save_fert_delivery_options(df: pd.DataFrame, user: str):
                 INSERT INTO fert_delivery_options (name, delta_per_t, active, created_at_utc, created_by)
                 VALUES (?, ?, ?, ?, ?)
             """, (nm, dp, ac, now, user))
-
-    c.commit()
-    c.close()
-
-def list_stock_stores(active_only: bool = False) -> pd.DataFrame:
-    c = conn()
-    if active_only:
-        df = pd.read_sql_query("""
-            SELECT store_id, name, postcode, lat, lon, active, created_at_utc, created_by
-            FROM stock_stores
-            WHERE active = 1
-            ORDER BY name ASC
-        """, c)
-    else:
-        df = pd.read_sql_query("""
-            SELECT store_id, name, postcode, lat, lon, active, created_at_utc, created_by
-            FROM stock_stores
-            ORDER BY name ASC
-        """, c)
-    c.close()
-    return df
-
-
-def save_stock_stores(df: pd.DataFrame, user: str):
-    """
-    expects cols: name, postcode, lat, lon, active
-    - upserts by name (unique-enough for internal tool)
-    - generates store_id for new rows
-    """
-    import uuid as _uuid
-
-    work = df.copy()
-    for col in ["name", "postcode"]:
-        if col not in work.columns:
-            raise ValueError(f"Missing column '{col}' in stock stores editor.")
-
-    work["name"] = work["name"].fillna("").astype(str).str.strip()
-    work["postcode"] = work["postcode"].fillna("").astype(str).str.strip()
-    work = work[(work["name"] != "") & (work["postcode"] != "")].copy()
-
-    if "lat" not in work.columns:
-        work["lat"] = None
-    if "lon" not in work.columns:
-        work["lon"] = None
-
-    if "active" not in work.columns:
-        work["active"] = 1
-    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
-
-    lowered = work["name"].str.lower()
-    if lowered.duplicated().any():
-        dups = work.loc[lowered.duplicated(), "name"].tolist()
-        raise ValueError(f"Duplicate store names detected: {dups}")
-
-    c = conn()
-    cur = c.cursor()
-    now = utc_now_iso()
-
-    # mark all inactive then re-apply actives (same pattern as other admin lists)
-    cur.execute("UPDATE stock_stores SET active = 0;")
-
-    for _, r in work.iterrows():
-        nm = str(r["name"]).strip()
-        pc = str(r["postcode"]).strip()
-        lat = r["lat"]
-        lon = r["lon"]
-        ac = int(r["active"])
-
-        cur.execute("SELECT store_id FROM stock_stores WHERE name = ?", (nm,))
-        ex = cur.fetchone()
-        if ex:
-            cur.execute("""
-                UPDATE stock_stores
-                SET postcode = ?, lat = ?, lon = ?, active = ?
-                WHERE name = ?
-            """, (pc, lat, lon, ac, nm))
-        else:
-            cur.execute("""
-                INSERT INTO stock_stores (store_id, name, postcode, lat, lon, active, created_at_utc, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (str(_uuid.uuid4()), nm, pc, lat, lon, ac, now, user))
-
-    c.commit()
-    c.close()
-
-
-def list_stock_store_products(active_only: bool = False) -> pd.DataFrame:
-    c = conn()
-    if active_only:
-        df = pd.read_sql_query("""
-            SELECT store_id, product, active, qty_t, updated_at_utc, updated_by
-            FROM stock_store_products
-            WHERE active = 1
-            ORDER BY product ASC
-        """, c)
-    else:
-        df = pd.read_sql_query("""
-            SELECT store_id, product, active, qty_t, updated_at_utc, updated_by
-            FROM stock_store_products
-            ORDER BY product ASC
-        """, c)
-    c.close()
-    return df
-
-
-def save_stock_store_products(df: pd.DataFrame, user: str):
-    """
-    expects cols: store_id, product, active (qty_t optional)
-    - soft reset active=0 then upsert
-    """
-    work = df.copy()
-    for col in ["store_id", "product"]:
-        if col not in work.columns:
-            raise ValueError(f"Missing column '{col}' in store products editor.")
-
-    work["store_id"] = work["store_id"].fillna("").astype(str).str.strip()
-    work["product"] = work["product"].fillna("").astype(str).str.strip()
-    work = work[(work["store_id"] != "") & (work["product"] != "")].copy()
-
-    if "qty_t" not in work.columns:
-        work["qty_t"] = None
-
-    if "active" not in work.columns:
-        work["active"] = 1
-    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
-
-    c = conn()
-    cur = c.cursor()
-    now = utc_now_iso()
-
-    cur.execute("UPDATE stock_store_products SET active = 0;")
-
-    for _, r in work.iterrows():
-        sid = str(r["store_id"]).strip()
-        prod = str(r["product"]).strip()
-        ac = int(r["active"])
-        qty = r["qty_t"]
-        cur.execute("""
-            INSERT INTO stock_store_products (store_id, product, active, qty_t, updated_at_utc, updated_by)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(store_id, product) DO UPDATE SET
-                active = excluded.active,
-                qty_t = excluded.qty_t,
-                updated_at_utc = excluded.updated_at_utc,
-                updated_by = excluded.updated_by
-        """, (sid, prod, ac, qty, now, user))
-
-    c.commit()
-    c.close()
-
-
-def get_haulage_settings() -> dict:
-    c = conn()
-    df = pd.read_sql_query("SELECT break_miles, per_mile_per_t FROM haulage_settings WHERE id = 1", c)
-    c.close()
-    if df.empty:
-        return {"break_miles": 100.0, "per_mile_per_t": 0.10}
-    return {"break_miles": float(df.loc[0, "break_miles"]), "per_mile_per_t": float(df.loc[0, "per_mile_per_t"])}
-
-
-def set_haulage_settings(break_miles: float, per_mile_per_t: float, user: str):
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-        INSERT INTO haulage_settings (id, break_miles, per_mile_per_t, updated_at_utc, updated_by)
-        VALUES (1, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            break_miles = excluded.break_miles,
-            per_mile_per_t = excluded.per_mile_per_t,
-            updated_at_utc = excluded.updated_at_utc,
-            updated_by = excluded.updated_by
-    """, (float(break_miles), float(per_mile_per_t), utc_now_iso(), user))
-    c.commit()
-    c.close()
-
-
-def list_haulage_bands(active_only: bool = False) -> pd.DataFrame:
-    c = conn()
-    if active_only:
-        df = pd.read_sql_query("""
-            SELECT band_id, min_miles, max_miles, charge_per_t, active, sort_order
-            FROM haulage_bands
-            WHERE active = 1
-            ORDER BY sort_order ASC, min_miles ASC
-        """, c)
-    else:
-        df = pd.read_sql_query("""
-            SELECT band_id, min_miles, max_miles, charge_per_t, active, sort_order
-            FROM haulage_bands
-            ORDER BY sort_order ASC, min_miles ASC
-        """, c)
-    c.close()
-    return df
-
-
-def save_haulage_bands(df: pd.DataFrame, user: str):
-    import uuid as _uuid
-
-    work = df.copy()
-    for col in ["min_miles", "max_miles", "charge_per_t"]:
-        if col not in work.columns:
-            raise ValueError(f"Missing column '{col}' in haulage bands editor.")
-
-    if "band_id" not in work.columns:
-        work["band_id"] = ""
-
-    if "active" not in work.columns:
-        work["active"] = 1
-    if "sort_order" not in work.columns:
-        work["sort_order"] = 0
-
-    work["min_miles"] = pd.to_numeric(work["min_miles"], errors="coerce")
-    work["max_miles"] = pd.to_numeric(work["max_miles"], errors="coerce")
-    work["charge_per_t"] = pd.to_numeric(work["charge_per_t"], errors="coerce")
-    work = work.dropna(subset=["min_miles", "max_miles", "charge_per_t"]).copy()
-
-    work["active"] = work["active"].apply(lambda x: 1 if bool(x) else 0).astype(int)
-    work["sort_order"] = pd.to_numeric(work["sort_order"], errors="coerce").fillna(0).astype(int)
-
-    c = conn()
-    cur = c.cursor()
-    cur.execute("UPDATE haulage_bands SET active = 0;")
-
-    for _, r in work.iterrows():
-        bid = str(r.get("band_id") or "").strip()
-        if not bid:
-            bid = str(_uuid.uuid4())
-        cur.execute("""
-            INSERT INTO haulage_bands (band_id, min_miles, max_miles, charge_per_t, active, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(band_id) DO UPDATE SET
-                min_miles = excluded.min_miles,
-                max_miles = excluded.max_miles,
-                charge_per_t = excluded.charge_per_t,
-                active = excluded.active,
-                sort_order = excluded.sort_order
-        """, (bid, float(r["min_miles"]), float(r["max_miles"]), float(r["charge_per_t"]), int(r["active"]), int(r["sort_order"])))
 
     c.commit()
     c.close()
@@ -1095,40 +873,51 @@ def save_small_lot_tiers(df: pd.DataFrame):
 
 # ---------------- Margins ----------------
 
-def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str):
+def add_margin(scope_type: str, scope_value: str, margin_per_t: float, user: str, role_code: str = "trader"):
     scope_type = str(scope_type).strip().lower()
     if scope_type not in ("category", "product"):
         raise ValueError("scope_type must be 'category' or 'product'.")
+
     scope_value = str(scope_value).strip()
     if not scope_value:
         raise ValueError("scope_value cannot be empty.")
+
+    role_code = str(role_code).strip().lower()
+    if not role_code:
+        role_code = "trader"
 
     c = conn()
     cur = c.cursor()
     cur.execute("""
         INSERT INTO price_margins
-        (scope_type, scope_value, margin_per_t, active, created_at_utc, created_by)
-        VALUES (?, ?, ?, 1, ?, ?)
-    """, (scope_type, scope_value, float(margin_per_t), utc_now_iso(), user))
+        (role_code, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by)
+        VALUES (?, ?, ?, ?, 1, ?, ?)
+    """, (role_code, scope_type, scope_value, float(margin_per_t), utc_now_iso(), user))
     c.commit()
     c.close()
 
 
-def list_margins(active_only: bool = True) -> pd.DataFrame:
+def list_margins(active_only: bool = True, role_code: str | None = None) -> pd.DataFrame:
     c = conn()
+
+    where = []
+    params = []
+
     if active_only:
-        df = pd.read_sql_query("""
-            SELECT margin_id, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by
-            FROM price_margins
-            WHERE active = 1
-            ORDER BY margin_id DESC
-        """, c)
-    else:
-        df = pd.read_sql_query("""
-            SELECT margin_id, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by
-            FROM price_margins
-            ORDER BY margin_id DESC
-        """, c)
+        where.append("active = 1")
+    if role_code:
+        where.append("role_code = ?")
+        params.append(str(role_code).strip().lower())
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    df = pd.read_sql_query(f"""
+        SELECT margin_id, role_code, scope_type, scope_value, margin_per_t, active, created_at_utc, created_by
+        FROM price_margins
+        {where_sql}
+        ORDER BY margin_id DESC
+    """, c, params=params)
+
     c.close()
     return df
 
@@ -1141,14 +930,14 @@ def deactivate_margin(margin_id: int):
     c.close()
 
 
-def get_effective_margins() -> pd.DataFrame:
+def get_effective_margins(role_code: str = "trader") -> pd.DataFrame:
     c = conn()
     df = pd.read_sql_query("""
-        SELECT margin_id, scope_type, scope_value, margin_per_t
+        SELECT margin_id, role_code, scope_type, scope_value, margin_per_t
         FROM price_margins
-        WHERE active = 1
+        WHERE active = 1 AND role_code = ?
         ORDER BY margin_id DESC
-    """, c)
+    """, c, params=(str(role_code).strip().lower(),))
     c.close()
 
     if df.empty:
@@ -1565,25 +1354,81 @@ def admin_mark_filled(order_id: str, admin_user: str, expected_version: int | No
         expected_version=expected_version,
     )
 
-def presence_heartbeat(user: str, role: str, page: str, session_id: str):
+def presence_heartbeat(
+    user: str,
+    role: str,
+    page: str,
+    session_id: str,
+    context: str = "",
+    *,
+    sample_seconds: int = 30
+):
     """
-    Upserts a presence heartbeat for this user+session.
+    Upserts a presence heartbeat for this user+session and appends to presence_events (history).
+
+    sample_seconds:
+      - to avoid exploding event volume, we only record a new event if the last recorded event
+        for this user+session is older than sample_seconds (default 30s).
     """
     if not user or not session_id:
         return
+
+    user = str(user).strip()
+    role = "" if role is None else str(role).strip()
+    page = "" if page is None else str(page).strip()
+    context = "" if context is None else str(context).strip()
+    session_id = str(session_id).strip()
 
     now = utc_now_iso()
 
     c = conn()
     cur = c.cursor()
+
+    # 1) presence "online now" upsert (existing behaviour)
     cur.execute("""
-        INSERT INTO user_presence (user, session_id, role, page, online_since_utc, last_seen_utc)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO user_presence (user, session_id, role, page, context, online_since_utc, last_seen_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user, session_id) DO UPDATE SET
             role = excluded.role,
             page = excluded.page,
+            context = excluded.context,
             last_seen_utc = excluded.last_seen_utc
-    """, (user, session_id, role, page, now, now))
+    """, (user, session_id, role, page, context, now, now))
+
+    # 2) append-only event log (sampled)
+    #    Only record if last event for this user+session is older than sample_seconds
+    should_insert = True
+    if sample_seconds and int(sample_seconds) > 0:
+        cur.execute("""
+            SELECT event_at_utc, COALESCE(page,''), COALESCE(context,'')
+            FROM presence_events
+            WHERE user = ? AND session_id = ?
+            ORDER BY event_at_utc DESC
+            LIMIT 1
+        """, (user, session_id))
+        r = cur.fetchone()
+        if r:
+            last_ts = r[0]
+            last_page = r[1] or ""
+            last_ctx = r[2] or ""
+            try:
+                # Always record if the page changed (even inside sample window)
+                if page != (last_page or "") or context != (last_ctx or ""):
+                    should_insert = True
+                else:
+                    last_dt = datetime.fromisoformat(last_ts)
+                    now_dt = datetime.fromisoformat(now)
+                    if (now_dt - last_dt).total_seconds() < int(sample_seconds):
+                        should_insert = False
+            except Exception:
+                should_insert = True
+
+    if should_insert:
+        cur.execute("""
+            INSERT INTO presence_events (event_at_utc, user, session_id, role, page, context)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (now, user, session_id, role, page, context))
+
     c.commit()
     c.close()
 
@@ -1607,7 +1452,7 @@ def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
     Returns distinct users considered 'online' if last_seen is within threshold.
     Also performs a small cleanup of stale sessions.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=int(online_within_seconds))).isoformat(timespec="seconds")
+    cutoff = utc_cutoff_iso(seconds=online_within_seconds)
 
     c = conn()
     cur = c.cursor()
@@ -1621,6 +1466,7 @@ def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
             user,
             MAX(role) AS role,
             MAX(page) AS page,
+            MAX(context) AS context,
             MIN(online_since_utc) AS online_since_utc,
             MAX(last_seen_utc) AS last_seen_utc
         FROM user_presence
@@ -1630,6 +1476,289 @@ def list_online_users(online_within_seconds: int = 45) -> pd.DataFrame:
     """, c, params=(cutoff,))
     c.close()
     return df
+
+def list_distinct_presence_users(days: int = 365) -> list[str]:
+    """
+    Distinct users seen in presence_events within last N days.
+    Returns sorted list.
+    """
+    cutoff = utc_cutoff_iso(days=days)
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT DISTINCT user
+        FROM presence_events
+        WHERE event_at_utc >= ?
+        ORDER BY user ASC
+    """, (cutoff,))
+    out = [r[0] for r in cur.fetchall()]
+    c.close()
+    return out
+
+
+def list_distinct_presence_pages(days: int = 365) -> list[str]:
+    """
+    Distinct pages seen in presence_events within last N days.
+    Returns sorted list.
+    """
+    cutoff = utc_cutoff_iso(days=int(days))
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT DISTINCT page
+        FROM presence_events
+        WHERE event_at_utc >= ?
+          AND COALESCE(page,'') != ''
+        ORDER BY page ASC
+    """, (cutoff,))
+    out = [r[0] for r in cur.fetchall()]
+    c.close()
+    return out
+
+def list_distinct_presence_contexts(days: int = 365) -> list[str]:
+    cutoff = utc_cutoff_iso(days=int(days))
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT DISTINCT COALESCE(context,'') AS context
+        FROM presence_events
+        WHERE event_at_utc >= ?
+          AND COALESCE(context,'') != ''
+        ORDER BY context ASC
+    """, (cutoff,))
+    out = [r[0] for r in cur.fetchall()]
+    c.close()
+    return out
+
+def list_presence_events(
+    *,
+    user: str | None = None,
+    role: str | None = None,
+    page: str | None = None,
+    context: str | None = None,
+    start_utc: str | None = None,
+    end_utc: str | None = None,
+    limit: int = 20000,
+) -> pd.DataFrame:
+    """
+    Raw presence_events with filters for admin audit.
+    """
+    q = """
+        SELECT
+            event_at_utc,
+            user,
+            session_id,
+            COALESCE(role,'') AS role,
+            COALESCE(page,'') AS page,
+            COALESCE(context,'') AS context
+        FROM presence_events
+    """
+    where = []
+    params: list = []
+
+    if user:
+        where.append("user = ?")
+        params.append(str(user).strip())
+    if role:
+        where.append("role = ?")
+        params.append(str(role).strip())
+    if page:
+        where.append("page = ?")
+        params.append(str(page).strip())
+    if start_utc:
+        where.append("event_at_utc >= ?")
+        params.append(start_utc)
+    if end_utc:
+        where.append("event_at_utc <= ?")
+        params.append(end_utc)
+    if context:
+        where.append("context = ?")
+        params.append(str(context).strip())
+
+    if where:
+        q += " WHERE " + " AND ".join(where)
+
+    q += " ORDER BY event_at_utc DESC"
+    q += f" LIMIT {int(limit)}"
+
+    c = conn()
+    df = pd.read_sql_query(q, c, params=params)
+    c.close()
+    return df
+
+def presence_daily_logins(start_utc: str, end_utc: str, *, user: str | None = None, context: str | None = None) -> pd.DataFrame:
+    """
+    Logins per day = count of distinct session_id by their FIRST seen timestamp.
+    """
+    params: list = [start_utc, end_utc]
+
+    user_clause = ""
+    if user:
+        user_clause = " AND user = ? "
+        params.append(str(user).strip())
+
+    ctx_clause = ""
+    if context:
+        ctx_clause = " AND COALESCE(context,'') = ? "
+        params.append(str(context).strip())
+
+    q = f"""
+    WITH first_seen AS (
+        SELECT session_id, user, MIN(event_at_utc) AS first_at
+        FROM presence_events
+        WHERE event_at_utc >= ? AND event_at_utc <= ?
+        {user_clause}
+        {ctx_clause}
+        GROUP BY session_id, user
+    )
+    SELECT
+        DATE(first_at) AS day,
+        COUNT(*) AS logins
+    FROM first_seen
+    GROUP BY DATE(first_at)
+    ORDER BY day ASC;
+    """
+
+    c = conn()
+    df = pd.read_sql_query(q, c, params=params)
+    c.close()
+    return df
+
+def presence_daily_page_transitions(start_utc: str, end_utc: str, *, user: str | None = None, context: str | None = None) -> pd.DataFrame:
+    """
+    Counts page transitions (when page differs from previous event within the session),
+    grouped by day and page.
+    """
+    params: list = [start_utc, end_utc]
+
+    user_clause = ""
+    if user:
+        user_clause = " AND user = ? "
+        params.append(str(user).strip())
+
+    ctx_clause = ""
+    if context:
+        ctx_clause = " AND COALESCE(context,'') = ? "
+        params.append(str(context).strip())
+        
+    q = f"""
+    WITH ordered AS (
+        SELECT
+            event_at_utc,
+            user,
+            session_id,
+            COALESCE(page,'') AS page,
+            COALESCE(context,'') AS context,
+            LAG(COALESCE(page,'')) OVER (PARTITION BY session_id ORDER BY event_at_utc) AS prev_page,
+            LAG(COALESCE(context,'')) OVER (PARTITION BY session_id ORDER BY event_at_utc) AS prev_context
+        FROM presence_events
+        WHERE event_at_utc >= ? AND event_at_utc <= ?
+        {user_clause}
+        {ctx_clause}
+    ),
+    transitions AS (
+        SELECT *
+        FROM ordered
+        WHERE prev_page IS NULL OR page != prev_page OR context != COALESCE(prev_context,'')
+    )
+    SELECT
+        DATE(event_at_utc) AS day,
+        page,
+        context,
+        COUNT(*) AS navigations
+    FROM transitions
+    WHERE page != ''
+    GROUP BY DATE(event_at_utc), page, context
+    ORDER BY day ASC, navigations DESC;
+    """
+
+    c = conn()
+    df = pd.read_sql_query(q, c, params=params)
+    c.close()
+    return df
+
+def utc_cutoff_iso(*, seconds: int | None = None, days: int | None = None) -> str:
+    dt = datetime.utcnow()
+    if seconds is not None:
+        dt = dt - timedelta(seconds=int(seconds))
+    if days is not None:
+        dt = dt - timedelta(days=int(days))
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def presence_session_summary(start_utc: str, end_utc: str, *, user: str | None = None, context: str | None = None) -> pd.DataFrame:
+    """
+    One row per session:
+      - first_at, last_at
+      - duration_seconds
+      - distinct_pages
+      - transitions (page changes)
+    """
+    params: list = [start_utc, end_utc]
+
+    user_clause = ""
+    if user:
+        user_clause = " AND user = ? "
+        params.append(str(user).strip())
+
+    ctx_clause = ""
+    if context:
+        ctx_clause = " AND COALESCE(context,'') = ? "
+        params.append(str(context).strip())
+
+    q = f"""
+    WITH base AS (
+        SELECT
+            event_at_utc,
+            user,
+            session_id,
+            COALESCE(page,'') AS page,
+            LAG(COALESCE(page,'')) OVER (PARTITION BY session_id ORDER BY event_at_utc) AS prev_page
+        FROM presence_events
+        WHERE event_at_utc >= ? AND event_at_utc <= ?
+        {user_clause}
+        {ctx_clause}
+    ),
+    per_session AS (
+        SELECT
+            user,
+            session_id,
+            MIN(event_at_utc) AS first_at,
+            MAX(event_at_utc) AS last_at,
+            COUNT(DISTINCT CASE WHEN page != '' THEN page END) AS distinct_pages,
+            SUM(CASE WHEN prev_page IS NULL OR page != prev_page THEN 1 ELSE 0 END) AS transitions
+        FROM base
+        GROUP BY user, session_id
+    )
+    SELECT
+        user,
+        session_id,
+        first_at,
+        last_at,
+        CAST((JULIANDAY(last_at) - JULIANDAY(first_at)) * 86400 AS INTEGER) AS duration_seconds,
+        distinct_pages,
+        transitions
+    FROM per_session
+    ORDER BY first_at DESC;
+    """
+
+    c = conn()
+    df = pd.read_sql_query(q, c, params=params)
+    c.close()
+    return df
+
+def prune_presence_events(keep_days: int = 180) -> int:
+    """
+    Deletes old presence_events beyond keep_days. Returns deleted rowcount.
+    Call manually or from a periodic admin action.
+    """
+    cutoff = utc_cutoff_iso(days=keep_days)
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM presence_events WHERE event_at_utc < ?", (cutoff,))
+    deleted = cur.rowcount
+    c.commit()
+    c.close()
+    return int(deleted or 0)
 
 def admin_margin_report() -> pd.DataFrame:
     """
@@ -1684,6 +1813,141 @@ def admin_blotter_lines() -> pd.DataFrame:
     df = pd.read_sql_query(q, c)
     c.close()
     return df
+
+def list_active_offers(book_code: str) -> pd.DataFrame:
+    """
+    Active now = active=1 AND starts_at <= now < ends_at
+    """
+    now = utc_now_iso()
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT
+            offer_id,
+            book_code,
+            product,
+            location,
+            delivery_window,
+            COALESCE(supplier,'') AS supplier,
+            mode,
+            value,
+            COALESCE(title,'') AS title,
+            active,
+            starts_at_utc,
+            ends_at_utc,
+            created_at_utc,
+            created_by
+        FROM todays_offers
+        WHERE book_code = ?
+          AND active = 1
+          AND starts_at_utc <= ?
+          AND ends_at_utc > ?
+        ORDER BY ends_at_utc ASC
+    """, c, params=(book_code, now, now))
+    c.close()
+    return df
+
+def list_offers(book_code: str | None = None, active_only: bool = False) -> pd.DataFrame:
+    c = conn()
+    q = """
+        SELECT
+            offer_id,
+            book_code,
+            product,
+            location,
+            delivery_window,
+            COALESCE(supplier,'') AS supplier,
+            mode,
+            value,
+            COALESCE(title,'') AS title,
+            active,
+            starts_at_utc,
+            ends_at_utc,
+            created_at_utc,
+            created_by
+        FROM todays_offers
+    """
+    where = []
+    params = []
+    if book_code:
+        where.append("book_code = ?")
+        params.append(book_code)
+    if active_only:
+        where.append("active = 1")
+
+    if where:
+        q += " WHERE " + " AND ".join(where)
+
+    q += " ORDER BY created_at_utc DESC"
+
+    df = pd.read_sql_query(q, c, params=params)
+    c.close()
+    return df
+
+
+def create_offer(
+    *,
+    book_code: str,
+    product: str,
+    location: str,
+    delivery_window: str,
+    supplier: str | None,
+    mode: str,
+    value: float,
+    title: str,
+    starts_at_utc: str,
+    ends_at_utc: str,
+    created_by: str,
+):
+    book_code = str(book_code).strip().lower()
+    if book_code not in ("fert", "seed"):
+        raise ValueError("book_code must be 'fert' or 'seed'.")
+
+    product = str(product).strip()
+    location = str(location).strip()
+    delivery_window = str(delivery_window).strip()
+    supplier = None if supplier is None or str(supplier).strip() == "" else str(supplier).strip()
+
+    mode = str(mode).strip().lower()
+    if mode not in ("delta", "fixed"):
+        raise ValueError("mode must be 'delta' or 'fixed'.")
+
+    value = float(value)
+    if value < 0:
+        raise ValueError("Offer value must be >= 0.")
+
+    if not product or not location or not delivery_window:
+        raise ValueError("product/location/delivery_window cannot be blank.")
+
+    s = datetime.fromisoformat(starts_at_utc)
+    e = datetime.fromisoformat(ends_at_utc)
+    if e <= s:
+        raise ValueError("ends_at_utc must be after starts_at_utc.")
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO todays_offers
+        (book_code, product, location, delivery_window, supplier, mode, value, title, active,
+         starts_at_utc, ends_at_utc, created_at_utc, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+    """, (
+        book_code, product, location, delivery_window, supplier,
+        mode, value, (title or "").strip(),
+        starts_at_utc, ends_at_utc,
+        utc_now_iso(), created_by
+    ))
+    c.commit()
+    c.close()
+
+
+def deactivate_offer(offer_id: int):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE todays_offers SET active = 0 WHERE offer_id = ?", (int(offer_id),))
+    c.commit()
+    c.close()
+
+
 
 
 
