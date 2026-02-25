@@ -50,6 +50,26 @@ from src.db import (
 
 from src import routing
 
+def _routing_road_miles(from_postcode: str, to_postcode: str) -> float:
+    """
+    Compatibility wrapper so ui.py works even if routing.py renamed the function.
+    routing.py MUST provide one of:
+      - get_road_miles(a,b)
+      - road_miles(a,b)
+      - get_miles(a,b)
+    """
+    fn = (
+        getattr(routing, "get_road_miles", None)
+        or getattr(routing, "road_miles", None)
+        or getattr(routing, "get_miles", None)
+    )
+    if fn is None:
+        raise AttributeError(
+            "routing.py is missing a road-miles function. "
+            "Add get_road_miles(from_postcode, to_postcode) to src/routing.py."
+        )
+    return float(fn(from_postcode, to_postcode))
+
 from src.validation import load_supplier_sheet, load_seed_sheet
 from src.optimizer import optimise_basket
 from src.pricing import apply_margins
@@ -588,7 +608,7 @@ def _apply_stock_pricing_with_routing(sell_prices: pd.DataFrame, delivery_postco
             if not s_post:
                 continue
 
-            miles = float(routing.get_road_miles(s_post, delivery_postcode))
+            miles = _routing_road_miles(s_post, delivery_postcode)
             if best is None or miles < best["miles"]:
                 best = {"store_id": sid, "store_name": str(s.get("name", "")), "miles": miles}
 
